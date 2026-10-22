@@ -322,27 +322,38 @@ impl ImageBrowserApp {
                 }
 
                 let mut preview_path = None;
+                let card_width = self.thumbnail_size + 32.0;
+                let available_width = ui.available_width();
+                let column_count = ((available_width + 8.0) / (card_width + 8.0))
+                    .floor()
+                    .max(1.0) as usize;
                 for (group_name, image_indices) in groups {
                     ui.heading(format!("{group_name} ({})", image_indices.len()));
                     ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for index in image_indices {
-                            let entry = &mut self.images[index];
-                            let selected = self.selected.contains(&entry.path);
-                            let (clicked, double_clicked) =
-                                draw_image_card(ui, ctx, entry, selected, self.thumbnail_size);
-                            if clicked {
-                                if selected {
-                                    self.selected.remove(&entry.path);
-                                } else {
-                                    self.selected.insert(entry.path.clone());
+                    egui::Grid::new(("image-grid", &group_name))
+                        .num_columns(column_count)
+                        .spacing(egui::vec2(8.0, 8.0))
+                        .show(ui, |ui| {
+                            for (position, index) in image_indices.into_iter().enumerate() {
+                                let entry = &mut self.images[index];
+                                let selected = self.selected.contains(&entry.path);
+                                let (clicked, double_clicked) =
+                                    draw_image_card(ui, ctx, entry, selected, self.thumbnail_size);
+                                if clicked {
+                                    if selected {
+                                        self.selected.remove(&entry.path);
+                                    } else {
+                                        self.selected.insert(entry.path.clone());
+                                    }
+                                }
+                                if double_clicked {
+                                    preview_path = Some(entry.path.clone());
+                                }
+                                if (position + 1) % column_count == 0 {
+                                    ui.end_row();
                                 }
                             }
-                            if double_clicked {
-                                preview_path = Some(entry.path.clone());
-                            }
-                        }
-                    });
+                        });
                     ui.add_space(12.0);
                 }
                 if let Some(path) = preview_path {
@@ -532,7 +543,7 @@ fn draw_image_card(
             ui.visuals().faint_bg_color
         })
         .show(ui, |ui| {
-            ui.set_width(thumbnail_size + 20.0);
+            ui.set_width(thumbnail_size + 16.0);
             let thumbnail_area = egui::vec2(thumbnail_size, thumbnail_size);
             if let Some(texture) = &entry.thumbnail {
                 let texture_size = texture.size_vec2();
