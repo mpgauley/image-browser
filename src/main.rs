@@ -3,6 +3,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -60,6 +67,53 @@ struct ImageEntry {
     perceptual_hash: Option<Option<u64>>,
 }
 
+struct ScannedImage {
+    path: PathBuf,
+    file_size: u64,
+    extension: String,
+}
+
+struct GroupingImage {
+    path: PathBuf,
+    dimensions: Option<(u32, u32)>,
+    dimensions_loaded: bool,
+    file_size: u64,
+    extension: String,
+    perceptual_hash: Option<Option<u64>>,
+}
+
+struct GroupingResult {
+    groups: ImageGroups,
+    dimensions: Vec<(usize, Option<(u32, u32)>)>,
+    hashes: Vec<(usize, Option<u64>)>,
+    failed: usize,
+}
+
+type ImageGroups = Vec<(String, Vec<usize>)>;
+
+enum BackgroundOutput {
+    FolderScan(Result<(Vec<ScannedImage>, usize), String>),
+    Grouping(GroupingResult),
+}
+
+enum BackgroundEvent {
+    Progress { completed: usize, total: usize },
+    Finished(BackgroundOutput),
+}
+
+struct BackgroundTask {
+    receiver: Receiver<BackgroundEvent>,
+    cancel: Arc<AtomicBool>,
+    started_at: Instant,
+    pending_output: Option<BackgroundOutput>,
+}
+
+struct TaskProgress {
+    label: String,
+    completed: usize,
+    total: usize,
+}
+
 struct Preview {
     path: PathBuf,
     texture: Option<TextureHandle>,
@@ -75,6 +129,10 @@ struct ImageBrowserApp {
     confirm_delete: bool,
     thumbnail_size: f32,
     group_mode: GroupMode,
+    all_images_group: Arc<ImageGroups>,
+    grouped_images: Option<Arc<ImageGroups>>,
+    background_task: Option<BackgroundTask>,
+    progress: Option<TaskProgress>,
     preview: Option<Preview>,
     status: String,
 }
@@ -94,6 +152,10 @@ impl ImageBrowserApp {
             confirm_delete: false,
             thumbnail_size: 160.0,
             group_mode: GroupMode::None,
+            all_images_group: Arc::new(Vec::new()),
+            grouped_images: None,
+            background_task: None,
+            progress: None,
             preview: None,
             status: String::new(),
         };
@@ -111,21 +173,21 @@ impl ImageBrowserApp {
             self.status = "Choose a folder to browse.".to_owned();
             return;
         };
-
-        match scan_directory(directory) {
-            Ok((images, skipped)) => {
-                let count = images.len();
-                self.images = images;
-                self.selected.clear();
-                self.selection_anchor = None;
-                self.status = if skipped > 0 {
-                    format!("Loaded {count} images; skipped {skipped} unreadable file(s).")
-                } else {
-                    format!("Loaded {count} images.")
-                };
-            }
-            Err(error) => self.status = format!("Could not open folder: {error:#}"),
-        }
+        let directory = directory.to_path_buf();
+        self.cancel_background_task();
+        self.grouped_images = None;
+        self.status = "Opening folder…".to_owned();
+        self.start_background_task("Opening folder", move |sender, cancel| {
+            let result = scan_directory_with_progress(
+                &directory,
+                |completed, total| {
+                    send_progress(&sender, completed, total, &cancel);
+                },
+                || cancel.load(Ordering::Relaxed),
+            )
+            .map_err(|error| format!("{error:#}"));
+            BackgroundOutput::FolderScan(result)
+        });
     }
 
     fn set_directory(&mut self, directory: PathBuf) {
@@ -136,38 +198,211 @@ impl ImageBrowserApp {
 
     fn set_group_mode(&mut self, mode: GroupMode) {
         self.group_mode = mode;
-        if mode == GroupMode::Dimensions {
-            let mut failed = 0;
-            for entry in &mut self.images {
-                if !entry.dimensions_loaded {
-                    entry.dimensions = image::image_dimensions(&entry.path).ok();
-                    entry.dimensions_loaded = true;
-                    failed += usize::from(entry.dimensions.is_none());
+        self.cancel_background_task();
+        if mode == GroupMode::None {
+            self.grouped_images = None;
+            self.status = format!("Showing {} images.", self.images.len());
+            return;
+        }
+        self.start_grouping(mode);
+    }
+
+    fn start_grouping(&mut self, mode: GroupMode) {
+        let images = self
+            .images
+            .iter()
+            .map(|entry| GroupingImage {
+                path: entry.path.clone(),
+                dimensions: entry.dimensions,
+                dimensions_loaded: entry.dimensions_loaded,
+                file_size: entry.file_size,
+                extension: entry.extension.clone(),
+                perceptual_hash: entry.perceptual_hash,
+            })
+            .collect();
+        self.grouped_images = None;
+        self.status = format!("Grouping images by {}…", mode.label().to_lowercase());
+        self.start_background_task(mode.label(), move |sender, cancel| {
+            BackgroundOutput::Grouping(group_images(images, mode, sender, cancel))
+        });
+    }
+
+    fn cancel_background_task(&mut self) {
+        if let Some(task) = self.background_task.take() {
+            task.cancel.store(true, Ordering::Relaxed);
+        }
+        self.progress = None;
+    }
+
+    fn start_background_task(
+        &mut self,
+        label: &str,
+        work: impl FnOnce(Sender<BackgroundEvent>, Arc<AtomicBool>) -> BackgroundOutput + Send + 'static,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        thread::spawn(move || {
+            let output = work(sender.clone(), Arc::clone(&worker_cancel));
+            if !worker_cancel.load(Ordering::Relaxed) {
+                let _ = sender.send(BackgroundEvent::Finished(output));
+            }
+        });
+        self.progress = Some(TaskProgress {
+            label: label.to_owned(),
+            completed: 0,
+            total: 0,
+        });
+        self.background_task = Some(BackgroundTask {
+            receiver,
+            cancel,
+            started_at: Instant::now(),
+            pending_output: None,
+        });
+    }
+
+    fn poll_background_task(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.background_task.as_ref() else {
+            return;
+        };
+        if task.pending_output.is_some() {
+            if task.started_at.elapsed() < Duration::from_millis(150) {
+                ctx.request_repaint_after(Duration::from_millis(40));
+                return;
+            }
+            let output = self
+                .background_task
+                .as_mut()
+                .and_then(|task| task.pending_output.take())
+                .expect("pending task output was checked");
+            self.background_task = None;
+            self.progress = None;
+            self.apply_background_output(output);
+            return;
+        }
+        let (events, disconnected) = {
+            let mut events = Vec::new();
+            let mut disconnected = false;
+            loop {
+                match task.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
-            self.status = if failed == 0 {
-                "Grouped images by dimensions.".to_owned()
-            } else {
-                format!("Could not read dimensions for {failed} image(s).")
-            };
-        } else if mode == GroupMode::Duplicates {
-            let mut failed = 0;
-            for entry in &mut self.images {
-                if entry.perceptual_hash.is_none() {
-                    entry.perceptual_hash = match perceptual_hash(&entry.path) {
-                        Ok(hash) => Some(Some(hash)),
-                        Err(_) => {
-                            failed += 1;
-                            Some(None)
-                        }
+            (events, disconnected)
+        };
+        let mut finished_output = None;
+        for event in events {
+            match event {
+                BackgroundEvent::Progress { completed, total } => {
+                    if let Some(progress) = &mut self.progress {
+                        progress.completed = completed;
+                        progress.total = total;
+                    }
+                }
+                BackgroundEvent::Finished(output) => {
+                    let task = self
+                        .background_task
+                        .as_mut()
+                        .expect("background task is still active");
+                    if task.started_at.elapsed() < Duration::from_millis(150) {
+                        task.pending_output = Some(output);
+                    } else {
+                        finished_output = Some(output);
+                    }
+                }
+            }
+        }
+        if let Some(output) = finished_output {
+            self.background_task = None;
+            self.progress = None;
+            self.apply_background_output(output);
+        } else if disconnected
+            && !self
+                .background_task
+                .as_ref()
+                .is_some_and(|task| task.pending_output.is_some())
+        {
+            self.background_task = None;
+            self.progress = None;
+            self.status = "Background task ended unexpectedly.".to_owned();
+        }
+        if self.background_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn apply_background_output(&mut self, output: BackgroundOutput) {
+        match output {
+            BackgroundOutput::FolderScan(Ok((scanned, skipped))) => {
+                let count = scanned.len();
+                self.images = scanned
+                    .into_iter()
+                    .map(|image| ImageEntry {
+                        path: image.path,
+                        dimensions: None,
+                        dimensions_loaded: false,
+                        file_size: image.file_size,
+                        extension: image.extension,
+                        thumbnail: None,
+                        thumbnail_loaded: false,
+                        thumbnail_error: None,
+                        perceptual_hash: None,
+                    })
+                    .collect();
+                self.selected.clear();
+                self.selection_anchor = None;
+                self.all_images_group = Arc::new(vec![("Images".to_owned(), (0..count).collect())]);
+                self.grouped_images = None;
+                if self.group_mode != GroupMode::None {
+                    self.status = if skipped > 0 {
+                        format!(
+                            "Loaded {count} images; skipped {skipped} unreadable file(s). Grouping…"
+                        )
+                    } else {
+                        format!("Loaded {count} images. Grouping…")
+                    };
+                    self.start_grouping(self.group_mode);
+                } else {
+                    self.status = if skipped > 0 {
+                        format!("Loaded {count} images; skipped {skipped} unreadable file(s).")
+                    } else {
+                        format!("Loaded {count} images.")
                     };
                 }
             }
-            self.status = if failed == 0 {
-                "Possible duplicates are grouped by visual similarity.".to_owned()
-            } else {
-                format!("Could not analyze {failed} image(s) for visual similarity.")
-            };
+            BackgroundOutput::FolderScan(Err(error)) => {
+                self.status = format!("Could not open folder: {error}");
+            }
+            BackgroundOutput::Grouping(result) => {
+                for (index, dimensions) in result.dimensions {
+                    if let Some(entry) = self.images.get_mut(index) {
+                        entry.dimensions = dimensions;
+                        entry.dimensions_loaded = true;
+                    }
+                }
+                for (index, hash) in result.hashes {
+                    if let Some(entry) = self.images.get_mut(index) {
+                        entry.perceptual_hash = Some(hash);
+                    }
+                }
+                self.grouped_images = Some(Arc::new(result.groups));
+                self.status = if result.failed > 0 {
+                    format!(
+                        "Grouping complete; could not analyze {} image(s).",
+                        result.failed
+                    )
+                } else {
+                    format!(
+                        "Grouping by {} complete.",
+                        self.group_mode.label().to_lowercase()
+                    )
+                };
+            }
         }
     }
 
@@ -260,22 +495,14 @@ impl ImageBrowserApp {
         };
     }
 
-    fn image_groups(&self) -> Vec<(String, Vec<usize>)> {
-        match self.group_mode {
-            GroupMode::None => vec![("Images".to_owned(), (0..self.images.len()).collect())],
-            GroupMode::Dimensions => group_by_key(&self.images, |entry| match entry.dimensions {
-                Some((width, height)) => format!("{width} × {height}"),
-                None => "Unknown dimensions".to_owned(),
-            }),
-            GroupMode::FileType => group_by_key(&self.images, |entry| {
-                if entry.extension.is_empty() {
-                    "Unknown file type".to_owned()
-                } else {
-                    format!(".{}", entry.extension.to_uppercase())
-                }
-            }),
-            GroupMode::SimilarSize => similar_size_groups(&self.images),
-            GroupMode::Duplicates => duplicate_groups(&self.images),
+    fn image_groups(&self) -> Arc<ImageGroups> {
+        if self.group_mode == GroupMode::None {
+            Arc::clone(&self.all_images_group)
+        } else {
+            self.grouped_images
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Vec::new()))
         }
     }
 
@@ -306,20 +533,26 @@ impl ImageBrowserApp {
 
             ui.horizontal(|ui| {
                 ui.label("Group:");
-                for mode in [
-                    GroupMode::None,
-                    GroupMode::Dimensions,
-                    GroupMode::SimilarSize,
-                    GroupMode::Duplicates,
-                    GroupMode::FileType,
-                ] {
-                    if ui
-                        .selectable_label(self.group_mode == mode, mode.label())
-                        .clicked()
-                    {
-                        self.set_group_mode(mode);
+                let folder_scanning = self
+                    .progress
+                    .as_ref()
+                    .is_some_and(|progress| progress.label == "Opening folder");
+                ui.add_enabled_ui(!folder_scanning, |ui| {
+                    for mode in [
+                        GroupMode::None,
+                        GroupMode::Dimensions,
+                        GroupMode::SimilarSize,
+                        GroupMode::Duplicates,
+                        GroupMode::FileType,
+                    ] {
+                        if ui
+                            .selectable_label(self.group_mode == mode, mode.label())
+                            .clicked()
+                        {
+                            self.set_group_mode(mode);
+                        }
                     }
-                }
+                });
             });
 
             ui.horizontal(|ui| {
@@ -375,7 +608,11 @@ impl ImageBrowserApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if self.images.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("No supported images in this folder.");
+                        ui.label(if self.background_task.is_some() {
+                            "Opening folder…"
+                        } else {
+                            "No supported images in this folder."
+                        });
                     });
                     return;
                 }
@@ -390,7 +627,7 @@ impl ImageBrowserApp {
                         indices.iter().map(|&index| self.images[index].path.clone())
                     })
                     .collect();
-                for (group_name, image_indices) in groups {
+                for (group_name, image_indices) in groups.iter() {
                     ui.heading(format!("{group_name} ({})", image_indices.len()));
                     ui.add_space(4.0);
                     egui::Grid::new((
@@ -402,7 +639,7 @@ impl ImageBrowserApp {
                     .num_columns(column_count)
                     .spacing(egui::vec2(GRID_SPACING, GRID_SPACING))
                     .show(ui, |ui| {
-                        for (position, index) in image_indices.into_iter().enumerate() {
+                        for (position, &index) in image_indices.iter().enumerate() {
                             let entry = &mut self.images[index];
                             let selected = self.selected.contains(&entry.path);
                             let (clicked, double_clicked) =
@@ -518,6 +755,7 @@ impl ImageBrowserApp {
 
 impl eframe::App for ImageBrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_task(ctx);
         self.draw_top_panel(ctx);
         self.draw_image_grid(ctx);
         self.draw_preview(ctx);
@@ -529,6 +767,29 @@ impl eframe::App for ImageBrowserApp {
                 if !self.images.is_empty() {
                     ui.separator();
                     ui.label(format!("{} images", self.images.len()));
+                }
+                if let Some(progress) = &self.progress {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(format!("{} / {}", progress.completed, progress.total));
+                        let fraction = if progress.total == 0 {
+                            0.0
+                        } else {
+                            progress.completed as f32 / progress.total as f32
+                        };
+                        let bar = egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                            .desired_width(180.0)
+                            .text(if progress.total == 0 {
+                                format!("{}…", progress.label)
+                            } else {
+                                format!("{} ({:.0}%)", progress.label, fraction * 100.0)
+                            });
+                        ui.add(if progress.total == 0 {
+                            bar.animate(true)
+                        } else {
+                            bar
+                        });
+                    });
                 }
             });
         });
@@ -637,22 +898,46 @@ fn default_directory() -> Option<PathBuf> {
         })
 }
 
-fn scan_directory(directory: &Path) -> Result<(Vec<ImageEntry>, usize)> {
-    let entries =
+fn scan_directory_with_progress(
+    directory: &Path,
+    mut report_progress: impl FnMut(usize, usize),
+    is_cancelled: impl Fn() -> bool,
+) -> Result<(Vec<ScannedImage>, usize)> {
+    let read_dir =
         fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        if is_cancelled() {
+            return Ok((Vec::new(), 0));
+        }
+        entries.push(entry);
+    }
+    let total = entries.len();
+    report_progress(0, total);
     let mut images = Vec::new();
     let mut skipped = 0;
+    let mut completed = 0;
 
     for entry in entries {
+        if is_cancelled() {
+            break;
+        }
+        completed += 1;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
                 skipped += 1;
+                if completed % 16 == 0 || completed == total {
+                    report_progress(completed, total);
+                }
                 continue;
             }
         };
         let path = entry.path();
         if !path.is_file() {
+            if completed % 16 == 0 || completed == total {
+                report_progress(completed, total);
+            }
             continue;
         }
         let extension = path
@@ -661,6 +946,9 @@ fn scan_directory(directory: &Path) -> Result<(Vec<ImageEntry>, usize)> {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !supported_extension(&extension) {
+            if completed % 16 == 0 || completed == total {
+                report_progress(completed, total);
+            }
             continue;
         }
 
@@ -668,20 +956,20 @@ fn scan_directory(directory: &Path) -> Result<(Vec<ImageEntry>, usize)> {
             Ok(metadata) => metadata,
             Err(_) => {
                 skipped += 1;
+                if completed % 16 == 0 || completed == total {
+                    report_progress(completed, total);
+                }
                 continue;
             }
         };
-        images.push(ImageEntry {
+        images.push(ScannedImage {
             path,
-            dimensions: None,
-            dimensions_loaded: false,
             file_size: metadata.len(),
             extension,
-            thumbnail: None,
-            thumbnail_loaded: false,
-            thumbnail_error: None,
-            perceptual_hash: None,
         });
+        if completed % 16 == 0 || completed == total {
+            report_progress(completed, total);
+        }
     }
 
     images.sort_by_cached_key(|entry| {
@@ -810,17 +1098,6 @@ fn texture_from_image(
     ))
 }
 
-fn group_by_key(
-    images: &[ImageEntry],
-    key: impl Fn(&ImageEntry) -> String,
-) -> Vec<(String, Vec<usize>)> {
-    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, entry) in images.iter().enumerate() {
-        groups.entry(key(entry)).or_default().push(index);
-    }
-    groups.into_iter().collect()
-}
-
 fn delete_files(paths: &[PathBuf]) -> (HashSet<PathBuf>, Vec<String>) {
     let mut deleted = HashSet::new();
     let mut failures = Vec::new();
@@ -838,14 +1115,137 @@ fn delete_files(paths: &[PathBuf]) -> (HashSet<PathBuf>, Vec<String>) {
     (deleted, failures)
 }
 
-fn similar_size_groups(images: &[ImageEntry]) -> Vec<(String, Vec<usize>)> {
+fn send_progress(
+    sender: &Sender<BackgroundEvent>,
+    completed: usize,
+    total: usize,
+    cancel: &AtomicBool,
+) {
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = sender.send(BackgroundEvent::Progress { completed, total });
+    }
+}
+
+fn group_images(
+    mut images: Vec<GroupingImage>,
+    mode: GroupMode,
+    sender: Sender<BackgroundEvent>,
+    cancel: Arc<AtomicBool>,
+) -> GroupingResult {
+    let count = images.len();
+    let mut dimensions = Vec::new();
+    let mut hashes = Vec::new();
+    let mut failed = 0;
+
+    let groups = match mode {
+        GroupMode::None => Vec::new(),
+        GroupMode::Dimensions => {
+            send_progress(&sender, 0, count, &cancel);
+            for (index, entry) in images.iter_mut().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !entry.dimensions_loaded {
+                    entry.dimensions = image::image_dimensions(&entry.path).ok();
+                    entry.dimensions_loaded = true;
+                    if entry.dimensions.is_none() {
+                        failed += 1;
+                    }
+                    dimensions.push((index, entry.dimensions));
+                }
+                if index % 8 == 0 || index + 1 == count {
+                    send_progress(&sender, index + 1, count, &cancel);
+                }
+            }
+            group_by_key(&images, |entry| match entry.dimensions {
+                Some((width, height)) => format!("{width} × {height}"),
+                None => "Unknown dimensions".to_owned(),
+            })
+        }
+        GroupMode::FileType => {
+            send_progress(&sender, 0, count, &cancel);
+            let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+            for (index, entry) in images.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let key = if entry.extension.is_empty() {
+                    "Unknown file type".to_owned()
+                } else {
+                    format!(".{}", entry.extension.to_uppercase())
+                };
+                grouped.entry(key).or_default().push(index);
+                if index % 16 == 0 || index + 1 == count {
+                    send_progress(&sender, index + 1, count, &cancel);
+                }
+            }
+            grouped.into_iter().collect()
+        }
+        GroupMode::SimilarSize => similar_size_groups(&images, &sender, &cancel),
+        GroupMode::Duplicates => {
+            let pair_count = images
+                .iter()
+                .enumerate()
+                .filter(|(_, image)| image.perceptual_hash.flatten().is_some())
+                .map(|(index, _)| count.saturating_sub(index + 1))
+                .sum::<usize>();
+            let total = count.saturating_add(pair_count);
+            send_progress(&sender, 0, total, &cancel);
+            for (index, entry) in images.iter_mut().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if entry.perceptual_hash.is_none() {
+                    entry.perceptual_hash = match perceptual_hash(&entry.path) {
+                        Ok(hash) => Some(Some(hash)),
+                        Err(_) => {
+                            failed += 1;
+                            Some(None)
+                        }
+                    };
+                    hashes.push((index, entry.perceptual_hash.flatten()));
+                }
+                if index % 8 == 0 || index + 1 == count {
+                    send_progress(&sender, index + 1, total, &cancel);
+                }
+            }
+            duplicate_groups(&images, &sender, &cancel, count, total)
+        }
+    };
+
+    GroupingResult {
+        groups,
+        dimensions,
+        hashes,
+        failed,
+    }
+}
+
+fn group_by_key(images: &[GroupingImage], key: impl Fn(&GroupingImage) -> String) -> ImageGroups {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in images.iter().enumerate() {
+        groups.entry(key(entry)).or_default().push(index);
+    }
+    groups.into_iter().collect()
+}
+
+fn similar_size_groups(
+    images: &[GroupingImage],
+    sender: &Sender<BackgroundEvent>,
+    cancel: &AtomicBool,
+) -> ImageGroups {
     let mut sorted: Vec<_> = (0..images.len()).collect();
+    send_progress(sender, 0, images.len(), cancel);
     sorted.sort_by_key(|&index| images[index].file_size);
 
     let mut groups = Vec::new();
     let mut current = Vec::new();
     let mut anchor = 0;
-    for index in sorted {
+    let count = sorted.len();
+    for (position, index) in sorted.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let size = images[index].file_size;
         if current.is_empty() {
             anchor = size;
@@ -857,6 +1257,9 @@ fn similar_size_groups(images: &[ImageEntry]) -> Vec<(String, Vec<usize>)> {
             anchor = size;
             current.push(index);
         }
+        if position % 16 == 0 || position + 1 == count {
+            send_progress(sender, position + 1, count, cancel);
+        }
     }
     if !current.is_empty() {
         groups.push(size_group(images, current));
@@ -864,7 +1267,7 @@ fn similar_size_groups(images: &[ImageEntry]) -> Vec<(String, Vec<usize>)> {
     groups
 }
 
-fn size_group(images: &[ImageEntry], indices: Vec<usize>) -> (String, Vec<usize>) {
+fn size_group(images: &[GroupingImage], indices: Vec<usize>) -> (String, Vec<usize>) {
     let smallest = indices
         .iter()
         .map(|&index| images[index].file_size)
@@ -885,23 +1288,51 @@ fn size_group(images: &[ImageEntry], indices: Vec<usize>) -> (String, Vec<usize>
     )
 }
 
-fn duplicate_groups(images: &[ImageEntry]) -> Vec<(String, Vec<usize>)> {
+fn duplicate_groups(
+    images: &[GroupingImage],
+    sender: &Sender<BackgroundEvent>,
+    cancel: &AtomicBool,
+    hash_progress: usize,
+    total_progress: usize,
+) -> ImageGroups {
     let mut parent: Vec<usize> = (0..images.len()).collect();
     let mut has_duplicate = vec![false; images.len()];
+    let pair_count = images
+        .iter()
+        .enumerate()
+        .filter(|(_, image)| image.perceptual_hash.flatten().is_some())
+        .map(|(index, _)| images.len().saturating_sub(index + 1))
+        .sum::<usize>();
+    let mut pairs_checked = 0;
     for left in 0..images.len() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let Some(left_hash) = images[left].perceptual_hash.flatten() else {
             continue;
         };
         for right in (left + 1)..images.len() {
-            let Some(right_hash) = images[right].perceptual_hash.flatten() else {
-                continue;
-            };
-            if (left_hash ^ right_hash).count_ones() <= DUPLICATE_HASH_DISTANCE {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            pairs_checked += 1;
+            if let Some(right_hash) = images[right].perceptual_hash.flatten()
+                && (left_hash ^ right_hash).count_ones() <= DUPLICATE_HASH_DISTANCE
+            {
                 let left_root = find_root(&mut parent, left);
                 let right_root = find_root(&mut parent, right);
                 parent[right_root] = left_root;
                 has_duplicate[left] = true;
                 has_duplicate[right] = true;
+            }
+            if pairs_checked % 2048 == 0 || pairs_checked == pair_count || right + 1 == images.len()
+            {
+                send_progress(
+                    sender,
+                    hash_progress + pairs_checked,
+                    total_progress,
+                    cancel,
+                );
             }
         }
     }
@@ -1093,16 +1524,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn image_entry(name: &str, size: u64, hash: Option<u64>) -> ImageEntry {
-        ImageEntry {
+    fn image_entry(name: &str, size: u64, hash: Option<u64>) -> GroupingImage {
+        GroupingImage {
             path: PathBuf::from(name),
             dimensions: Some((640, 480)),
             dimensions_loaded: true,
             file_size: size,
             extension: "jpg".to_owned(),
-            thumbnail: None,
-            thumbnail_loaded: false,
-            thumbnail_error: None,
             perceptual_hash: Some(hash),
         }
     }
@@ -1113,15 +1541,59 @@ mod tests {
         let path = root.join("photo.png");
         image::RgbaImage::new(12, 8).save(&path).unwrap();
 
-        let (images, skipped) = scan_directory(&root).unwrap();
+        let mut progress = Vec::new();
+        let (images, skipped) = scan_directory_with_progress(
+            &root,
+            |completed, total| {
+                progress.push((completed, total));
+            },
+            || false,
+        )
+        .unwrap();
 
         assert_eq!(skipped, 0);
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].dimensions, None);
-        assert!(!images[0].dimensions_loaded);
-        assert!(images[0].thumbnail.is_none());
-        assert!(!images[0].thumbnail_loaded);
+        assert_eq!(images[0].path, path);
+        assert_eq!(images[0].file_size, fs::metadata(&path).unwrap().len());
+        assert_eq!(progress.last(), Some(&(1, 1)));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grouping_modes_report_completion_progress() {
+        for mode in [
+            GroupMode::Dimensions,
+            GroupMode::SimilarSize,
+            GroupMode::Duplicates,
+            GroupMode::FileType,
+        ] {
+            let images = vec![
+                image_entry("a.jpg", 1000, Some(0)),
+                image_entry("b.png", 1090, Some(1)),
+            ];
+            let (sender, receiver) = mpsc::channel();
+            let result = group_images(images, mode, sender, Arc::new(AtomicBool::new(false)));
+            let progress: Vec<_> = receiver
+                .try_iter()
+                .filter_map(|event| match event {
+                    BackgroundEvent::Progress { completed, total } => Some((completed, total)),
+                    BackgroundEvent::Finished(_) => None,
+                })
+                .collect();
+
+            assert!(
+                !result.groups.is_empty(),
+                "{} produced no groups",
+                mode.label()
+            );
+            assert!(
+                progress
+                    .last()
+                    .is_some_and(|(completed, total)| completed == total),
+                "{} did not reach completion",
+                mode.label()
+            );
+        }
     }
 
     #[test]
@@ -1263,7 +1735,8 @@ mod tests {
             image_entry("c.jpg", 1300, None),
         ];
 
-        let groups = similar_size_groups(&images);
+        let (sender, _receiver) = mpsc::channel();
+        let groups = similar_size_groups(&images, &sender, &AtomicBool::new(false));
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].1, vec![0, 1]);
@@ -1278,7 +1751,14 @@ mod tests {
             image_entry("c.jpg", 1000, Some(u64::MAX)),
         ];
 
-        let groups = duplicate_groups(&images);
+        let (sender, _receiver) = mpsc::channel();
+        let groups = duplicate_groups(
+            &images,
+            &sender,
+            &AtomicBool::new(false),
+            images.len(),
+            images.len() + images.len() * (images.len() - 1) / 2,
+        );
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].1, vec![0, 1]);
