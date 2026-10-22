@@ -5,13 +5,16 @@ A Linux desktop file browser built with Rust, focused on quickly browsing and or
 ## Features
 
 - Browse image files in a folder and open a larger preview by double-clicking a thumbnail.
-- Load image pixels and thumbnails lazily as cards enter the visible viewport.
+- Decode thumbnails in the background, in the current display order, while keeping the folder view responsive.
 - Show live progress while folders are scanned and images are grouped.
 - Increase or decrease thumbnail size.
 - Group images by dimensions, approximate file size (within 10%), or file type.
 - Select multiple images and copy or move them to another folder.
 - Delete selected images after confirming the permanent deletion.
-- View selected-file names, types, dimensions, sizes, and timestamps in a dedicated metadata panel.
+- Right-click a thumbnail to copy, move, or delete images, or set a single selected image as the desktop wallpaper.
+- Detect connected displays; GNOME and Cinnamon set the wallpaper globally, while KDE Plasma supports individual, selected multiple, or all displays.
+- Set a selected-image slideshow across all displays with a persistent user service; its interval slider ranges from 5 seconds to 1 year and image changes follow UTC system-clock boundaries. Right-click and choose “Stop wallpaper slideshow” to stop it.
+- View selected-file names, types, dimensions, sizes, and modification times in a dedicated metadata panel.
 - Existing files are never overwritten: copies and moves receive a numbered name when needed.
 
 ## Supported formats
@@ -26,6 +29,8 @@ Install Rust, `pkg-config`, and the dav1d development package used to decode AVI
 sudo apt install pkg-config libdav1d-dev
 cargo run --release
 ```
+
+Persistent wallpaper slideshows require a systemd user session and Python 3; the desktop's wallpaper tools (GSettings on GNOME/Cinnamon or `qdbus` on KDE Plasma) must also be available.
 
 Build a Linux executable with:
 

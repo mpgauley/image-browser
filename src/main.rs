@@ -3,10 +3,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread,
     time::{Duration, Instant},
@@ -101,6 +102,24 @@ struct BackgroundTask {
     pending_output: Option<BackgroundOutput>,
 }
 
+struct DecodedThumbnail {
+    image: ColorImage,
+    dimensions: (u32, u32),
+}
+
+enum ThumbnailEvent {
+    Loaded {
+        index: usize,
+        result: std::result::Result<DecodedThumbnail, String>,
+    },
+    Finished,
+}
+
+struct ThumbnailTask {
+    receiver: Receiver<ThumbnailEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
 struct TaskProgress {
     label: String,
     completed: usize,
@@ -112,7 +131,6 @@ struct SelectedFileMetadata {
     file_type: String,
     dimensions: String,
     size: String,
-    created: String,
     modified: String,
 }
 
@@ -121,6 +139,178 @@ struct Preview {
     texture: Option<TextureHandle>,
     error: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopEnvironment {
+    Gnome,
+    Cinnamon,
+    KdePlasma,
+    Other,
+}
+
+impl DesktopEnvironment {
+    fn detect() -> Self {
+        let desktops = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_lowercase();
+        if desktops.contains("cinnamon") {
+            Self::Cinnamon
+        } else if desktops.contains("gnome") {
+            Self::Gnome
+        } else if desktops.contains("kde") || desktops.contains("plasma") {
+            Self::KdePlasma
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayInfo {
+    name: String,
+    plasma_screen: usize,
+}
+
+#[derive(Clone)]
+enum WallpaperTarget {
+    Display(usize),
+    Displays(Vec<usize>),
+}
+
+enum ContextMenuAction {
+    Copy,
+    Move,
+    Delete,
+    SetWallpaper(PathBuf, WallpaperTarget),
+    ChooseMultipleDisplays(PathBuf),
+    ChooseSlideshow(Vec<PathBuf>),
+    StopSlideshow,
+}
+
+struct CardContext<'a> {
+    selected: bool,
+    selected_count: usize,
+    selected_paths: &'a [PathBuf],
+    desktop_environment: DesktopEnvironment,
+    displays: &'a [DisplayInfo],
+    display_detection_error: Option<&'a str>,
+}
+
+struct WallpaperDisplayDialog {
+    path: PathBuf,
+    selected: HashSet<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlideshowInterval {
+    unit: String,
+    value: u64,
+    label: String,
+}
+
+struct SlideshowSetupDialog {
+    paths: Vec<PathBuf>,
+    interval_index: usize,
+}
+
+#[derive(serde::Serialize)]
+struct SlideshowConfig {
+    desktop: &'static str,
+    interval_unit: String,
+    interval_value: u64,
+    paths_hex: Vec<String>,
+    plasma_screens: Vec<usize>,
+}
+
+const SLIDESHOW_WORKER: &str = r#"#!/usr/bin/python3
+import datetime
+import json
+import os
+import subprocess
+import time
+import urllib.parse
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+
+def read_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as stream:
+        config = json.load(stream)
+    config["paths"] = [os.fsdecode(bytes.fromhex(path)) for path in config["paths_hex"]]
+    return config
+
+def image_slot(now, unit, value):
+    epoch = int(now.timestamp())
+    if unit in ("seconds", "minutes", "hours", "days", "weeks"):
+        factor = {"seconds": 1, "minutes": 60, "hours": 3600,
+                  "days": 86400, "weeks": 604800}[unit] * value
+        if unit == "weeks":
+            epoch -= 345600
+        slot = epoch // factor
+        boundary_offset = 345600 if unit == "weeks" else 0
+        return slot, (slot + 1) * factor + boundary_offset
+    if unit == "months":
+        month = (now.year - 1970) * 12 + now.month - 1
+        slot = month // value
+        next_month = (slot + 1) * value
+        year, month_index = divmod(next_month, 12)
+        boundary = datetime.datetime(1970 + year, month_index + 1, 1,
+                                    tzinfo=datetime.timezone.utc)
+        return slot, int(boundary.timestamp())
+    year = now.year - 1970
+    slot = year // value
+    boundary_year = 1970 + (slot + 1) * value
+    boundary = datetime.datetime(boundary_year, 1, 1,
+                                 tzinfo=datetime.timezone.utc)
+    return slot, int(boundary.timestamp())
+
+def set_wallpaper(config, path):
+    desktop = config["desktop"]
+    if desktop in ("gnome", "cinnamon"):
+        schema = ("org.gnome.desktop.background" if desktop == "gnome"
+                  else "org.cinnamon.desktop.background")
+        uri = "file://" + urllib.parse.quote(path, safe="/")
+        subprocess.run(["gsettings", "set", schema, "picture-uri", uri],
+                       check=True)
+        if desktop == "gnome":
+            subprocess.run(["gsettings", "set", schema, "picture-uri-dark", uri],
+                           check=True)
+        return
+    uri = "file://" + urllib.parse.quote(path, safe="/")
+    screens = ",".join(str(screen) for screen in config["plasma_screens"])
+    script = ("var selectedScreens = [" + screens + "]; "
+              "for (var key in desktops()) { var d = desktops()[key]; "
+              "if (selectedScreens.indexOf(d.screen) >= 0) { "
+              "d.wallpaperPlugin = 'org.kde.image'; "
+              "d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General']; "
+              "d.writeConfig('Image', '" + uri + "'); "
+              "d.writeConfig('FillMode', 2); } }")
+    last_error = None
+    for executable in ("qdbus6", "qdbus"):
+        try:
+            subprocess.run([executable, "org.kde.plasmashell", "/PlasmaShell",
+                            "org.kde.PlasmaShell.evaluateScript", script],
+                           check=True, stdout=subprocess.DEVNULL)
+            return
+        except (OSError, subprocess.CalledProcessError) as error:
+            last_error = error
+    raise RuntimeError("could not set the Plasma wallpaper: " + str(last_error))
+
+def main():
+    while True:
+        config = read_config()
+        if not config["paths"]:
+            raise RuntimeError("slideshow has no images")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        slot, next_boundary = image_slot(
+            now, config["interval_unit"], config["interval_value"])
+        image = config["paths"][slot % len(config["paths"])]
+        set_wallpaper(config, image)
+        delay = max(0.1, next_boundary - time.time())
+        time.sleep(delay)
+
+if __name__ == "__main__":
+    main()
+"#;
 
 struct ImageBrowserApp {
     current_dir: Option<PathBuf>,
@@ -134,14 +324,25 @@ struct ImageBrowserApp {
     all_images_group: Arc<ImageGroups>,
     grouped_images: Option<Arc<ImageGroups>>,
     background_task: Option<BackgroundTask>,
+    thumbnail_task: Option<ThumbnailTask>,
     progress: Option<TaskProgress>,
     preview: Option<Preview>,
+    desktop_environment: DesktopEnvironment,
+    displays: Vec<DisplayInfo>,
+    display_detection_error: Option<String>,
+    wallpaper_display_dialog: Option<WallpaperDisplayDialog>,
+    slideshow_setup_dialog: Option<SlideshowSetupDialog>,
     status: String,
 }
 
 impl ImageBrowserApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let current_dir = default_directory();
+        let desktop_environment = DesktopEnvironment::detect();
+        let (displays, display_detection_error) = detect_displays(desktop_environment).map_or_else(
+            |error| (Vec::new(), Some(format!("{error:#}"))),
+            |displays| (displays, None),
+        );
         let mut app = Self {
             path_input: current_dir
                 .as_ref()
@@ -157,8 +358,14 @@ impl ImageBrowserApp {
             all_images_group: Arc::new(Vec::new()),
             grouped_images: None,
             background_task: None,
+            thumbnail_task: None,
             progress: None,
             preview: None,
+            desktop_environment,
+            displays,
+            display_detection_error,
+            wallpaper_display_dialog: None,
+            slideshow_setup_dialog: None,
             status: String::new(),
         };
 
@@ -176,6 +383,7 @@ impl ImageBrowserApp {
             return;
         };
         let directory = directory.to_path_buf();
+        self.cancel_thumbnail_task();
         self.cancel_background_task();
         self.grouped_images = None;
         self.status = "Opening folder…".to_owned();
@@ -199,11 +407,13 @@ impl ImageBrowserApp {
     }
 
     fn set_group_mode(&mut self, mode: GroupMode) {
+        self.cancel_thumbnail_task();
         self.group_mode = mode;
         self.cancel_background_task();
         if mode == GroupMode::None {
             self.grouped_images = None;
             self.status = format!("Showing {} images.", self.images.len());
+            self.start_thumbnail_loading();
             return;
         }
         self.start_grouping(mode);
@@ -233,6 +443,96 @@ impl ImageBrowserApp {
             task.cancel.store(true, Ordering::Relaxed);
         }
         self.progress = None;
+    }
+
+    fn cancel_thumbnail_task(&mut self) {
+        if let Some(task) = self.thumbnail_task.take() {
+            task.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn start_thumbnail_loading(&mut self) {
+        self.cancel_thumbnail_task();
+        let groups = self.image_groups();
+        let pending = pending_thumbnail_jobs(&self.images, &groups);
+        if pending.is_empty() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        thread::spawn(move || {
+            for (index, path) in pending {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = load_thumbnail_image(&path, THUMBNAIL_MAX_EDGE)
+                    .map_err(|error| format!("{error:#}"));
+                if !send_thumbnail_event(
+                    &sender,
+                    ThumbnailEvent::Loaded { index, result },
+                    &worker_cancel,
+                ) {
+                    return;
+                }
+            }
+            let _ = send_thumbnail_event(&sender, ThumbnailEvent::Finished, &worker_cancel);
+        });
+        self.thumbnail_task = Some(ThumbnailTask { receiver, cancel });
+    }
+
+    fn poll_thumbnail_task(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.thumbnail_task.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match task.receiver.try_recv() {
+                Ok(event) => events.push(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        let mut finished = false;
+        for event in events {
+            match event {
+                ThumbnailEvent::Loaded { index, result } => {
+                    if let Some(entry) = self.images.get_mut(index) {
+                        entry.thumbnail_loaded = true;
+                        match result {
+                            Ok(decoded) => {
+                                entry.dimensions = Some(decoded.dimensions);
+                                entry.dimensions_loaded = true;
+                                entry.thumbnail = Some(ctx.load_texture(
+                                    entry.path.display().to_string(),
+                                    decoded.image,
+                                    TextureOptions::LINEAR,
+                                ));
+                            }
+                            Err(error) => {
+                                entry.dimensions_loaded = true;
+                                entry.thumbnail_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                ThumbnailEvent::Finished => finished = true,
+            }
+        }
+        if finished || disconnected {
+            if disconnected && !finished {
+                self.status = "Thumbnail loading ended unexpectedly.".to_owned();
+            }
+            self.thumbnail_task = None;
+        } else if self.thumbnail_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
     }
 
     fn start_background_task(
@@ -373,6 +673,7 @@ impl ImageBrowserApp {
                     } else {
                         format!("Loaded {count} images.")
                     };
+                    self.start_thumbnail_loading();
                 }
             }
             BackgroundOutput::FolderScan(Err(error)) => {
@@ -397,6 +698,7 @@ impl ImageBrowserApp {
                         self.group_mode.label().to_lowercase()
                     )
                 };
+                self.start_thumbnail_loading();
             }
         }
     }
@@ -443,9 +745,7 @@ impl ImageBrowserApp {
         }
 
         if moving {
-            self.images
-                .retain(|entry| !moved_paths.contains(&entry.path));
-            self.selected.retain(|path| !moved_paths.contains(path));
+            self.remove_images_from_view(&moved_paths);
         }
         self.status = match (completed, failures.is_empty()) {
             (count, true) => format!(
@@ -470,15 +770,7 @@ impl ImageBrowserApp {
 
         let selected: Vec<_> = self.selected.iter().cloned().collect();
         let (deleted, failures) = delete_files(&selected);
-        self.images.retain(|entry| !deleted.contains(&entry.path));
-        self.selected.retain(|path| !deleted.contains(path));
-        if self
-            .selection_anchor
-            .as_ref()
-            .is_some_and(|path| deleted.contains(path))
-        {
-            self.selection_anchor = None;
-        }
+        self.remove_images_from_view(&deleted);
         self.status = match (deleted.len(), failures.is_empty()) {
             (count, true) => format!("Deleted {count} image(s)."),
             (0, false) => format!("No images were deleted. {}", failures.join(" | ")),
@@ -488,6 +780,230 @@ impl ImageBrowserApp {
                 failures.join(" | ")
             ),
         };
+    }
+
+    fn remove_images_from_view(&mut self, removed_paths: &HashSet<PathBuf>) {
+        if removed_paths.is_empty() {
+            return;
+        }
+        let mut index_mapping = vec![None; self.images.len()];
+        let mut remaining =
+            Vec::with_capacity(self.images.len().saturating_sub(removed_paths.len()));
+        for (old_index, entry) in self.images.drain(..).enumerate() {
+            if !removed_paths.contains(&entry.path) {
+                index_mapping[old_index] = Some(remaining.len());
+                remaining.push(entry);
+            }
+        }
+        self.images = remaining;
+        self.selected.retain(|path| !removed_paths.contains(path));
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|path| removed_paths.contains(path))
+        {
+            self.selection_anchor = None;
+        }
+        self.all_images_group = Arc::new(vec![(
+            "Images".to_owned(),
+            (0..self.images.len()).collect(),
+        )]);
+        if let Some(groups) = self.grouped_images.as_ref() {
+            self.grouped_images = Some(Arc::new(remap_image_groups(
+                groups,
+                &index_mapping,
+                &self.images,
+                self.group_mode,
+            )));
+        }
+    }
+
+    fn apply_context_menu_action(&mut self, action: ContextMenuAction) {
+        match action {
+            ContextMenuAction::Copy => self.copy_or_move_selected(false),
+            ContextMenuAction::Move => self.copy_or_move_selected(true),
+            ContextMenuAction::Delete => self.confirm_delete = true,
+            ContextMenuAction::SetWallpaper(path, target) => {
+                match stop_wallpaper_slideshow().and_then(|()| {
+                    set_wallpaper(self.desktop_environment, &path, target, &self.displays)
+                }) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Set {} as wallpaper.",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                    }
+                    Err(error) => self.status = format!("Could not set wallpaper: {error:#}"),
+                }
+            }
+            ContextMenuAction::ChooseMultipleDisplays(path) => {
+                self.wallpaper_display_dialog = Some(WallpaperDisplayDialog {
+                    path,
+                    selected: HashSet::new(),
+                });
+            }
+            ContextMenuAction::ChooseSlideshow(paths) => {
+                self.slideshow_setup_dialog = Some(SlideshowSetupDialog {
+                    paths,
+                    interval_index: 15,
+                });
+            }
+            ContextMenuAction::StopSlideshow => match stop_wallpaper_slideshow() {
+                Ok(()) => self.status = "Stopped the wallpaper slideshow.".to_owned(),
+                Err(error) => {
+                    self.status = format!("Could not stop the wallpaper slideshow: {error:#}")
+                }
+            },
+        }
+    }
+
+    fn draw_slideshow_setup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.slideshow_setup_dialog.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let interval_options = slideshow_intervals();
+        if dialog.interval_index >= interval_options.len() {
+            self.slideshow_setup_dialog = None;
+            self.status = "The selected slideshow interval is invalid.".to_owned();
+            return;
+        }
+        egui::Window::new("Set wallpaper slideshow")
+            .id(egui::Id::new("wallpaper-slideshow-setup"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} images will cycle across all displays.",
+                    dialog.paths.len()
+                ));
+                ui.add(
+                    egui::Slider::new(&mut dialog.interval_index, 0..=interval_options.len() - 1)
+                        .step_by(1.0)
+                        .show_value(false)
+                        .text("Change wallpaper every"),
+                );
+                let interval = &interval_options[dialog.interval_index];
+                ui.strong(format!("Current selection: {}", interval.label));
+                ui.horizontal(|ui| {
+                    if ui.button("Start slideshow").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel {
+            open = false;
+        }
+        if apply {
+            let Some(dialog) = self.slideshow_setup_dialog.take() else {
+                return;
+            };
+            let interval = &interval_options[dialog.interval_index];
+            match start_wallpaper_slideshow(
+                self.desktop_environment,
+                interval,
+                &dialog.paths,
+                &self.displays,
+            ) {
+                Ok(()) => {
+                    self.status = format!(
+                        "Started a {}-image wallpaper slideshow, changing every {}.",
+                        dialog.paths.len(),
+                        interval.label
+                    );
+                }
+                Err(error) => {
+                    self.status = format!("Could not start wallpaper slideshow: {error:#}")
+                }
+            }
+        } else if !open {
+            self.slideshow_setup_dialog = None;
+        }
+    }
+
+    fn draw_wallpaper_display_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.wallpaper_display_dialog.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let file_name = dialog
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        egui::Window::new("Set wallpaper on multiple displays")
+            .id(egui::Id::new("wallpaper-display-selection"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Image: {file_name}"));
+                ui.label("Select at least two displays.");
+                for (index, display) in self.displays.iter().enumerate() {
+                    let mut selected = dialog.selected.contains(&index);
+                    if ui.checkbox(&mut selected, &display.name).changed() {
+                        if selected {
+                            dialog.selected.insert(index);
+                        } else {
+                            dialog.selected.remove(&index);
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            dialog.selected.len() >= 2,
+                            egui::Button::new("Set wallpaper"),
+                        )
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel {
+            open = false;
+        }
+        if apply {
+            let Some(dialog) = self.wallpaper_display_dialog.take() else {
+                return;
+            };
+            match set_wallpaper(
+                self.desktop_environment,
+                &dialog.path,
+                WallpaperTarget::Displays(
+                    dialog
+                        .selected
+                        .into_iter()
+                        .filter_map(|index| {
+                            self.displays
+                                .get(index)
+                                .map(|display| display.plasma_screen)
+                        })
+                        .collect(),
+                ),
+                &self.displays,
+            ) {
+                Ok(()) => {
+                    self.status = "Updated wallpaper on selected displays.".to_owned();
+                }
+                Err(error) => self.status = format!("Could not set wallpaper: {error:#}"),
+            }
+        } else if !open {
+            self.wallpaper_display_dialog = None;
+        }
     }
 
     fn image_groups(&self) -> Arc<ImageGroups> {
@@ -598,6 +1114,8 @@ impl ImageBrowserApp {
 
     fn draw_image_grid(&mut self, ctx: &egui::Context) {
         let groups = self.image_groups();
+        let mut context_clicked_path = None;
+        let mut context_action = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if self.images.is_empty() {
@@ -621,6 +1139,11 @@ impl ImageBrowserApp {
                         indices.iter().map(|&index| self.images[index].path.clone())
                     })
                     .collect();
+                let selected_paths: Vec<_> = display_order
+                    .iter()
+                    .filter(|path| self.selected.contains(*path))
+                    .cloned()
+                    .collect();
                 for (group_name, image_indices) in groups.iter() {
                     ui.heading(format!("{group_name} ({})", image_indices.len()));
                     ui.add_space(4.0);
@@ -636,8 +1159,28 @@ impl ImageBrowserApp {
                         for (position, &index) in image_indices.iter().enumerate() {
                             let entry = &mut self.images[index];
                             let selected = self.selected.contains(&entry.path);
-                            let (clicked, double_clicked) =
-                                draw_image_card(ui, ctx, entry, selected, thumbnail_size);
+                            let (clicked, double_clicked, secondary_clicked, action) =
+                                draw_image_card(
+                                    ui,
+                                    entry,
+                                    CardContext {
+                                        selected,
+                                        selected_count: self.selected.len(),
+                                        selected_paths: &selected_paths,
+                                        desktop_environment: self.desktop_environment,
+                                        displays: &self.displays,
+                                        display_detection_error: self
+                                            .display_detection_error
+                                            .as_deref(),
+                                    },
+                                    thumbnail_size,
+                                );
+                            if secondary_clicked {
+                                context_clicked_path = Some(entry.path.clone());
+                            }
+                            if action.is_some() {
+                                context_action = action;
+                            }
                             if clicked {
                                 let (shift, toggle) = ctx.input(|input| {
                                     (
@@ -673,6 +1216,16 @@ impl ImageBrowserApp {
                 }
             });
         });
+        if let Some(path) = context_clicked_path
+            && !self.selected.contains(&path)
+        {
+            self.selected.clear();
+            self.selected.insert(path.clone());
+            self.selection_anchor = Some(path);
+        }
+        if let Some(action) = context_action {
+            self.apply_context_menu_action(action);
+        }
     }
 
     fn draw_preview(&mut self, ctx: &egui::Context) {
@@ -787,7 +1340,6 @@ impl ImageBrowserApp {
                                         ui.end_row();
                                         metadata_row(ui, "Dimensions", &metadata.dimensions);
                                         metadata_row(ui, "Size", &metadata.size);
-                                        metadata_row(ui, "Date created", &metadata.created);
                                         metadata_row(ui, "Date modified", &metadata.modified);
                                         ui.end_row();
                                     }
@@ -836,11 +1388,15 @@ impl ImageBrowserApp {
 impl eframe::App for ImageBrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_task(ctx);
+        self.poll_thumbnail_task(ctx);
         self.draw_top_panel(ctx);
         self.draw_status_panel(ctx);
         self.draw_selected_metadata(ctx);
         self.draw_image_grid(ctx);
         self.draw_preview(ctx);
+        self.draw_wallpaper_display_dialog(ctx);
+        self.draw_slideshow_setup_dialog(ctx);
+        self.draw_wallpaper_display_dialog(ctx);
         self.draw_delete_confirmation(ctx);
     }
 }
@@ -1034,15 +1590,16 @@ fn scan_directory_with_progress(
 
 fn draw_image_card(
     ui: &mut egui::Ui,
-    ctx: &egui::Context,
     entry: &mut ImageEntry,
-    selected: bool,
+    context: CardContext<'_>,
     thumbnail_size: f32,
-) -> (bool, bool) {
+) -> (bool, bool, bool, Option<ContextMenuAction>) {
     let mut clicked = false;
     let mut double_clicked = false;
+    let mut secondary_clicked = false;
+    let mut context_action = None;
     egui::Frame::group(ui.style())
-        .fill(if selected {
+        .fill(if context.selected {
             ui.visuals().selection.bg_fill
         } else {
             ui.visuals().faint_bg_color
@@ -1054,40 +1611,144 @@ fn draw_image_card(
                 thumbnail_area,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
-                    if !entry.thumbnail_loaded && ui.is_rect_visible(ui.max_rect()) {
-                        entry.thumbnail_loaded = true;
-                        match load_thumbnail(ctx, &entry.path, THUMBNAIL_MAX_EDGE) {
-                            Ok((texture, dimensions)) => {
-                                entry.thumbnail = Some(texture);
-                                entry.dimensions = Some(dimensions);
-                                entry.dimensions_loaded = true;
+                    let response = ui.interact(
+                        ui.max_rect(),
+                        egui::Id::new(("thumbnail-card", &entry.path)),
+                        egui::Sense::click(),
+                    );
+                    clicked = response.clicked();
+                    double_clicked = response.double_clicked();
+                    secondary_clicked = response.secondary_clicked();
+                    response.context_menu(|ui| {
+                        if ui.button("Copy To…").clicked() {
+                            context_action = Some(ContextMenuAction::Copy);
+                            ui.close_menu();
+                        }
+                        if ui.button("Move To…").clicked() {
+                            context_action = Some(ContextMenuAction::Move);
+                            ui.close_menu();
+                        }
+                        if ui.button("Delete").clicked() {
+                            context_action = Some(ContextMenuAction::Delete);
+                            ui.close_menu();
+                        }
+
+                        let effective_selection_count = if context.selected {
+                            context.selected_count
+                        } else {
+                            1
+                        };
+                        if effective_selection_count == 1 {
+                            ui.separator();
+                            match context.desktop_environment {
+                                DesktopEnvironment::Gnome | DesktopEnvironment::Cinnamon => {
+                                    let label = if context.displays.len() > 1 {
+                                        format!(
+                                            "Set as wallpaper on all {} displays",
+                                            context.displays.len()
+                                        )
+                                    } else {
+                                        "Set as wallpaper".to_owned()
+                                    };
+                                    if ui.button(label).clicked() {
+                                        context_action = Some(ContextMenuAction::SetWallpaper(
+                                            entry.path.clone(),
+                                            WallpaperTarget::Displays(Vec::new()),
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                }
+                                DesktopEnvironment::KdePlasma if context.displays.len() == 1 => {
+                                    if ui.button("Set as wallpaper").clicked() {
+                                        context_action = Some(ContextMenuAction::SetWallpaper(
+                                            entry.path.clone(),
+                                            WallpaperTarget::Display(0),
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                }
+                                DesktopEnvironment::KdePlasma if context.displays.len() > 1 => {
+                                    ui.menu_button("Set wallpaper on…", |ui| {
+                                        for (index, display) in context.displays.iter().enumerate()
+                                        {
+                                            if ui.button(&display.name).clicked() {
+                                                context_action =
+                                                    Some(ContextMenuAction::SetWallpaper(
+                                                        entry.path.clone(),
+                                                        WallpaperTarget::Display(index),
+                                                    ));
+                                                ui.close_menu();
+                                            }
+                                        }
+                                        ui.separator();
+                                        if ui.button("Multiple displays…").clicked() {
+                                            context_action =
+                                                Some(ContextMenuAction::ChooseMultipleDisplays(
+                                                    entry.path.clone(),
+                                                ));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("All displays").clicked() {
+                                            context_action = Some(ContextMenuAction::SetWallpaper(
+                                                entry.path.clone(),
+                                                WallpaperTarget::Displays(
+                                                    context
+                                                        .displays
+                                                        .iter()
+                                                        .map(|display| display.plasma_screen)
+                                                        .collect(),
+                                                ),
+                                            ));
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                                DesktopEnvironment::KdePlasma => {
+                                    ui.label("Display detection unavailable").on_hover_text(
+                                        context.display_detection_error.unwrap_or(
+                                            "Could not enumerate the connected displays.",
+                                        ),
+                                    );
+                                }
+                                DesktopEnvironment::Other => {}
                             }
-                            Err(error) => {
-                                entry.dimensions_loaded = true;
-                                entry.thumbnail_error = Some(format!("{error:#}"));
+                        } else if !matches!(context.desktop_environment, DesktopEnvironment::Other)
+                        {
+                            ui.separator();
+                            if ui.button("Set slideshow on all displays…").clicked() {
+                                let paths = if context.selected {
+                                    context.selected_paths.to_vec()
+                                } else {
+                                    vec![entry.path.clone()]
+                                };
+                                context_action = Some(ContextMenuAction::ChooseSlideshow(paths));
+                                ui.close_menu();
                             }
                         }
-                    }
+                        if !matches!(context.desktop_environment, DesktopEnvironment::Other) {
+                            ui.separator();
+                            if ui.button("Stop wallpaper slideshow").clicked() {
+                                context_action = Some(ContextMenuAction::StopSlideshow);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if let Some(texture) = &entry.thumbnail {
                         let texture_size = texture.size_vec2();
                         let factor =
                             (thumbnail_size / texture_size.x).min(thumbnail_size / texture_size.y);
                         let size = texture_size * factor;
-                        let response = ui.add(
-                            egui::Image::new(texture)
-                                .fit_to_exact_size(size)
-                                .sense(egui::Sense::click()),
-                        );
-                        clicked = response.clicked();
-                        double_clicked = response.double_clicked();
-                    } else if entry.thumbnail_loaded {
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                    } else if !entry.thumbnail_loaded {
+                        ui.label("Loading thumbnail…");
+                    } else {
                         let error = entry.thumbnail_error.as_deref().unwrap_or("Unknown error");
                         ui.label("Preview unavailable").on_hover_text(error);
                     }
                 },
             );
         });
-    (clicked, double_clicked)
+    (clicked, double_clicked, secondary_clicked, context_action)
 }
 
 fn load_texture(ctx: &egui::Context, path: &Path, max_edge: u32) -> Result<TextureHandle> {
@@ -1095,15 +1756,588 @@ fn load_texture(ctx: &egui::Context, path: &Path, max_edge: u32) -> Result<Textu
     texture_from_image(ctx, path, &image, max_edge)
 }
 
-fn load_thumbnail(
-    ctx: &egui::Context,
+fn detect_displays(desktop: DesktopEnvironment) -> Result<Vec<DisplayInfo>> {
+    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+    let mut errors = Vec::new();
+
+    if desktop == DesktopEnvironment::KdePlasma {
+        match detect_kscreen_displays() {
+            Ok(displays) if !displays.is_empty() => return Ok(displays),
+            Ok(_) => errors.push("kscreen-doctor reported no active displays".to_owned()),
+            Err(error) => errors.push(format!("kscreen-doctor: {error:#}")),
+        }
+    }
+
+    if session_type.eq_ignore_ascii_case("wayland")
+        && matches!(
+            desktop,
+            DesktopEnvironment::Gnome | DesktopEnvironment::Cinnamon
+        )
+    {
+        match detect_mutter_displays() {
+            Ok(displays) if !displays.is_empty() => return Ok(displays),
+            Ok(_) => errors.push("Mutter reported no active displays".to_owned()),
+            Err(error) => errors.push(format!("Mutter: {error:#}")),
+        }
+    }
+
+    if !session_type.eq_ignore_ascii_case("wayland") {
+        match detect_xrandr_displays() {
+            Ok(displays) if !displays.is_empty() => return Ok(displays),
+            Ok(_) => errors.push("xrandr reported no active displays".to_owned()),
+            Err(error) => errors.push(format!("xrandr: {error:#}")),
+        }
+    }
+
+    if session_type.eq_ignore_ascii_case("wayland")
+        && !matches!(
+            desktop,
+            DesktopEnvironment::Gnome | DesktopEnvironment::Cinnamon
+        )
+    {
+        match detect_wlr_displays() {
+            Ok(displays) if !displays.is_empty() => return Ok(displays),
+            Ok(_) => errors.push("wlr-randr reported no active displays".to_owned()),
+            Err(error) => errors.push(format!("wlr-randr: {error:#}")),
+        }
+    }
+
+    Err(anyhow!("could not detect displays ({})", errors.join("; ")))
+}
+
+fn detect_xrandr_displays() -> Result<Vec<DisplayInfo>> {
+    let output = Command::new("xrandr")
+        .arg("--listmonitors")
+        .output()
+        .context("running xrandr --listmonitors")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "xrandr exited with {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_xrandr_displays(&text))
+}
+
+fn parse_xrandr_displays(output: &str) -> Vec<DisplayInfo> {
+    output
+        .lines()
+        .filter(|line| {
+            line.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+        })
+        .filter_map(|line| {
+            let (index, fields) = line.trim().split_once(':')?;
+            let plasma_screen = index.parse().ok()?;
+            let name = fields.split_whitespace().last()?.to_owned();
+            Some(DisplayInfo {
+                name,
+                plasma_screen,
+            })
+        })
+        .collect()
+}
+
+fn detect_kscreen_displays() -> Result<Vec<DisplayInfo>> {
+    let output = Command::new("kscreen-doctor")
+        .arg("-o")
+        .output()
+        .context("running kscreen-doctor -o")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "kscreen-doctor exited with {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_kscreen_displays(&text))
+}
+
+fn parse_kscreen_displays(output: &str) -> Vec<DisplayInfo> {
+    let mut displays = Vec::new();
+    for line in output.lines().filter(|line| line.starts_with("Output:")) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 4 || !fields.contains(&"enabled") || !fields.contains(&"connected") {
+            continue;
+        }
+        let name = fields[2].to_owned();
+        displays.push(DisplayInfo {
+            name,
+            plasma_screen: displays.len(),
+        });
+    }
+    displays
+}
+
+fn detect_mutter_displays() -> Result<Vec<DisplayInfo>> {
+    let output = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Mutter.DisplayConfig",
+            "--object-path",
+            "/org/gnome/Mutter/DisplayConfig",
+            "--method",
+            "org.gnome.Mutter.DisplayConfig.GetCurrentState",
+        ])
+        .output()
+        .context("querying Mutter display configuration with gdbus")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gdbus exited with {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_mutter_displays(&text))
+}
+
+fn parse_mutter_displays(output: &str) -> Vec<DisplayInfo> {
+    let Some(start) = output.find('[') else {
+        return Vec::new();
+    };
+    let mut monitors = Vec::new();
+    let mut square_depth = 0;
+    let mut paren_depth = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in output.bytes().enumerate().skip(start) {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'\'' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' => quoted = true,
+            b'[' => square_depth += 1,
+            b']' => {
+                square_depth -= 1;
+                if square_depth == 0 {
+                    break;
+                }
+            }
+            b'(' if square_depth == 1 && paren_depth == 0 => {
+                let tail = &output[index + 1..];
+                let Some(name) = tail
+                    .trim_start()
+                    .strip_prefix('\'')
+                    .and_then(|tail| tail.split_once('\'').map(|(name, _)| name))
+                else {
+                    return Vec::new();
+                };
+                monitors.push(DisplayInfo {
+                    name: name.to_owned(),
+                    plasma_screen: monitors.len(),
+                });
+                paren_depth += 1;
+            }
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            _ => {}
+        }
+    }
+    monitors
+}
+
+fn detect_wlr_displays() -> Result<Vec<DisplayInfo>> {
+    let output = Command::new("wlr-randr")
+        .output()
+        .context("running wlr-randr")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "wlr-randr exited with {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter_map(|line| line.split_whitespace().next())
+        .enumerate()
+        .map(|(plasma_screen, name)| DisplayInfo {
+            name: name.to_owned(),
+            plasma_screen,
+        })
+        .collect())
+}
+
+fn set_wallpaper(
+    desktop: DesktopEnvironment,
     path: &Path,
-    max_edge: u32,
-) -> Result<(TextureHandle, (u32, u32))> {
+    target: WallpaperTarget,
+    displays: &[DisplayInfo],
+) -> Result<()> {
+    if !path.is_file() {
+        return Err(anyhow!("{} is not a readable file", path.display()));
+    }
+    match desktop {
+        DesktopEnvironment::Gnome => {
+            set_gsettings_wallpaper("org.gnome.desktop.background", path, true)
+        }
+        DesktopEnvironment::Cinnamon => {
+            set_gsettings_wallpaper("org.cinnamon.desktop.background", path, false)
+        }
+        DesktopEnvironment::KdePlasma => {
+            let screens = match target {
+                WallpaperTarget::Display(index) => vec![
+                    displays
+                        .get(index)
+                        .ok_or_else(|| anyhow!("display {index} is no longer available"))?
+                        .plasma_screen,
+                ],
+                WallpaperTarget::Displays(screens) => screens,
+            };
+            set_plasma_wallpaper(path, &screens)
+        }
+        DesktopEnvironment::Other => Err(anyhow!(
+            "wallpaper setting is supported on GNOME, Cinnamon, and KDE Plasma"
+        )),
+    }
+}
+
+fn slideshow_intervals() -> Vec<SlideshowInterval> {
+    let mut intervals = Vec::with_capacity(48);
+    for seconds in (5..=60).step_by(5) {
+        intervals.push(SlideshowInterval {
+            unit: "seconds".to_owned(),
+            value: seconds,
+            label: if seconds == 60 {
+                "1 minute".to_owned()
+            } else {
+                format!("{seconds} seconds")
+            },
+        });
+    }
+    for minutes in 2..=30 {
+        intervals.push(SlideshowInterval {
+            unit: "minutes".to_owned(),
+            value: minutes,
+            label: format!("{minutes} minutes"),
+        });
+    }
+    for (unit, value, label) in [
+        ("hours", 1, "1 hour"),
+        ("hours", 6, "6 hours"),
+        ("hours", 12, "12 hours"),
+        ("days", 1, "1 day"),
+        ("weeks", 1, "1 week"),
+        ("months", 1, "1 month"),
+        ("years", 1, "1 year"),
+    ] {
+        intervals.push(SlideshowInterval {
+            unit: unit.to_owned(),
+            value,
+            label: label.to_owned(),
+        });
+    }
+    intervals
+}
+
+fn start_wallpaper_slideshow(
+    desktop: DesktopEnvironment,
+    interval: &SlideshowInterval,
+    paths: &[PathBuf],
+    displays: &[DisplayInfo],
+) -> Result<()> {
+    if paths.len() < 2 {
+        return Err(anyhow!("select at least two images for the slideshow"));
+    }
+    if desktop == DesktopEnvironment::Other {
+        return Err(anyhow!(
+            "wallpaper slideshows are not supported on this desktop"
+        ));
+    }
+    for path in paths {
+        if !path.is_file() {
+            return Err(anyhow!("{} is not a readable file", path.display()));
+        }
+    }
+    if desktop == DesktopEnvironment::KdePlasma && displays.is_empty() {
+        return Err(anyhow!("could not detect any KDE Plasma displays"));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("could not determine the home directory"))?;
+    let data_dir = home.join(".local/share/image-browser/slideshow");
+    let unit_dir = home.join(".config/systemd/user");
+    fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+    fs::create_dir_all(&unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
+
+    let config = SlideshowConfig {
+        desktop: match desktop {
+            DesktopEnvironment::Gnome => "gnome",
+            DesktopEnvironment::Cinnamon => "cinnamon",
+            DesktopEnvironment::KdePlasma => "kde",
+            DesktopEnvironment::Other => unreachable!(),
+        },
+        interval_unit: interval.unit.clone(),
+        interval_value: interval.value,
+        paths_hex: paths.iter().map(|path| path_to_hex(path)).collect(),
+        plasma_screens: displays
+            .iter()
+            .map(|display| display.plasma_screen)
+            .collect(),
+    };
+    let config_json = serde_json::to_vec_pretty(&config).context("serializing slideshow config")?;
+    let config_path = data_dir.join("config.json");
+    fs::write(&config_path, config_json)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
+    let worker_path = data_dir.join("worker.py");
+    fs::write(&worker_path, SLIDESHOW_WORKER)
+        .with_context(|| format!("writing {}", worker_path.display()))?;
+
+    let python = find_executable("python3")
+        .ok_or_else(|| anyhow!("python3 is required to run the persistent slideshow"))?;
+    let service_path = unit_dir.join("image-browser-slideshow.service");
+    let service = format!(
+        "[Unit]\nDescription=Image Browser wallpaper slideshow\nAfter=graphical-session.target\n\n\
+         [Service]\nType=simple\nExecStart={} {}\nRestart=on-failure\nRestartSec=5\n\n\
+         [Install]\nWantedBy=default.target\n",
+        systemd_quote(&python.display().to_string()),
+        systemd_quote(&worker_path.display().to_string())
+    );
+    fs::write(&service_path, service)
+        .with_context(|| format!("writing {}", service_path.display()))?;
+
+    import_desktop_environment()?;
+    systemctl_user(&["daemon-reload"])?;
+    systemctl_user(&["enable", "image-browser-slideshow.service"])?;
+    systemctl_user(&["restart", "image-browser-slideshow.service"])?;
+    if !systemctl_user_succeeded(&["is-active", "--quiet", "image-browser-slideshow.service"]) {
+        let status = Command::new("systemctl")
+            .args([
+                "--user",
+                "status",
+                "--no-pager",
+                "--full",
+                "image-browser-slideshow.service",
+            ])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "systemd did not start the slideshow service: {status}"
+        ));
+    }
+    Ok(())
+}
+
+fn stop_wallpaper_slideshow() -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("could not determine the home directory"))?;
+    let unit_dir = home.join(".config/systemd/user");
+    let service_path = unit_dir.join("image-browser-slideshow.service");
+    if !service_path.exists() {
+        return Ok(());
+    }
+    systemctl_user(&["disable", "--now", "image-browser-slideshow.service"])?;
+    fs::remove_file(&service_path)
+        .with_context(|| format!("removing {}", service_path.display()))?;
+    let data_dir = home.join(".local/share/image-browser/slideshow");
+    for name in ["config.json", "worker.py"] {
+        let path = data_dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", path.display()));
+            }
+        }
+    }
+    systemctl_user(&["daemon-reload"])?;
+    Ok(())
+}
+
+fn import_desktop_environment() -> Result<()> {
+    let variables = [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "XDG_CURRENT_DESKTOP",
+    ];
+    let present: Vec<_> = variables
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut command = Command::new("systemctl");
+    command
+        .arg("--user")
+        .arg("import-environment")
+        .args(present);
+    run_and_check(&mut command, "importing desktop session environment")
+}
+
+fn systemctl_user(args: &[&str]) -> Result<()> {
+    let mut command = Command::new("systemctl");
+    command.arg("--user").args(args);
+    run_and_check(
+        &mut command,
+        &format!("systemctl --user {}", args.join(" ")),
+    )
+}
+
+fn systemctl_user_succeeded(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn find_executable(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|directory| {
+        let candidate = directory.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn systemd_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('%', "%%")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
+}
+
+fn path_to_hex(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn set_gsettings_wallpaper(schema: &str, path: &Path, set_dark_uri: bool) -> Result<()> {
+    let uri = file_uri(path)?;
+    run_and_check(
+        Command::new("gsettings").args(["set", schema, "picture-uri", &uri]),
+        "setting the desktop wallpaper",
+    )?;
+    if set_dark_uri {
+        run_and_check(
+            Command::new("gsettings").args(["set", schema, "picture-uri-dark", &uri]),
+            "setting the dark-theme desktop wallpaper",
+        )
+        .context("the regular wallpaper was set, but the dark-theme wallpaper failed")?;
+    }
+    Ok(())
+}
+
+fn set_plasma_wallpaper(path: &Path, screens: &[usize]) -> Result<()> {
+    if screens.is_empty() {
+        return Err(anyhow!("no displays were selected"));
+    }
+    let uri = file_uri(path)?;
+    let selected_screens = screens
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "var selectedScreens = [{selected_screens}]; \
+         for (var key in desktops()) {{ \
+         var d = desktops()[key]; \
+         if (selectedScreens.indexOf(d.screen) >= 0) {{ \
+         d.wallpaperPlugin = 'org.kde.image'; \
+         d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General']; \
+         d.writeConfig('Image', '{uri}'); \
+         d.writeConfig('FillMode', 2); \
+         }} }}"
+    );
+    let mut last_error = None;
+    for executable in ["qdbus6", "qdbus"] {
+        match Command::new(executable)
+            .args([
+                "org.kde.plasmashell",
+                "/PlasmaShell",
+                "org.kde.PlasmaShell.evaluateScript",
+                &script,
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{executable} exited with {}: {}",
+                    output.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Err(error) => last_error = Some(format!("{executable}: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "could not contact Plasma to set the wallpaper ({})",
+        last_error.unwrap_or_else(|| "no qdbus executable found".to_owned())
+    ))
+}
+
+fn file_uri(path: &Path) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.is_absolute() {
+        return Err(anyhow!("wallpaper path must be absolute"));
+    }
+    let mut uri = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(*byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Ok(uri)
+}
+
+fn run_and_check(command: &mut Command, action: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("running command for {action}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{action} failed with {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn load_thumbnail_image(path: &Path, max_edge: u32) -> Result<DecodedThumbnail> {
     let image = image::open(path).with_context(|| format!("decoding {}", path.display()))?;
     let dimensions = (image.width(), image.height());
-    let texture = texture_from_image(ctx, path, &image, max_edge)?;
-    Ok((texture, dimensions))
+    let thumbnail = image.thumbnail(max_edge, max_edge).to_rgba8();
+    let size = [thumbnail.width() as usize, thumbnail.height() as usize];
+    let color_image = ColorImage::from_rgba_unmultiplied(size, thumbnail.as_raw());
+    Ok(DecodedThumbnail {
+        image: color_image,
+        dimensions,
+    })
 }
 
 fn texture_from_image(
@@ -1148,6 +2382,37 @@ fn send_progress(
     if !cancel.load(Ordering::Relaxed) {
         let _ = sender.send(BackgroundEvent::Progress { completed, total });
     }
+}
+
+fn send_thumbnail_event(
+    sender: &SyncSender<ThumbnailEvent>,
+    mut event: ThumbnailEvent,
+    cancel: &AtomicBool,
+) -> bool {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        match sender.try_send(event) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned_event)) => {
+                event = returned_event;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+fn pending_thumbnail_jobs(images: &[ImageEntry], groups: &ImageGroups) -> Vec<(usize, PathBuf)> {
+    groups
+        .iter()
+        .flat_map(|(_, indices)| indices)
+        .filter_map(|&index| {
+            let entry = &images[index];
+            (!entry.thumbnail_loaded).then(|| (index, entry.path.clone()))
+        })
+        .collect()
 }
 
 fn group_images(
@@ -1220,12 +2485,6 @@ fn selected_file_metadata(entry: &mut ImageEntry) -> SelectedFileMetadata {
         entry.dimensions_loaded = true;
     }
     let metadata = fs::metadata(&entry.path);
-    let created = metadata
-        .as_ref()
-        .ok()
-        .and_then(|metadata| metadata.created().ok())
-        .map(format_system_time)
-        .unwrap_or_else(|| "Unavailable".to_owned());
     let modified = metadata
         .as_ref()
         .ok()
@@ -1247,7 +2506,6 @@ fn selected_file_metadata(entry: &mut ImageEntry) -> SelectedFileMetadata {
         file_type,
         dimensions,
         size: format_file_size(entry.file_size),
-        created,
         modified,
     }
 }
@@ -1268,6 +2526,46 @@ fn group_by_key(images: &[GroupingImage], key: impl Fn(&GroupingImage) -> String
         groups.entry(key(entry)).or_default().push(index);
     }
     groups.into_iter().collect()
+}
+
+fn remap_image_groups(
+    groups: &ImageGroups,
+    index_mapping: &[Option<usize>],
+    images: &[ImageEntry],
+    mode: GroupMode,
+) -> ImageGroups {
+    groups
+        .iter()
+        .filter_map(|(name, old_indices)| {
+            let new_indices: Vec<_> = old_indices
+                .iter()
+                .filter_map(|&old_index| index_mapping.get(old_index).copied().flatten())
+                .collect();
+            if new_indices.is_empty() {
+                return None;
+            }
+            let new_name = if mode == GroupMode::SimilarSize {
+                let smallest = new_indices
+                    .iter()
+                    .map(|&index| images[index].file_size)
+                    .min()
+                    .unwrap_or_default();
+                let largest = new_indices
+                    .iter()
+                    .map(|&index| images[index].file_size)
+                    .max()
+                    .unwrap_or_default();
+                format!(
+                    "Similar size: {}–{}",
+                    format_file_size(smallest),
+                    format_file_size(largest)
+                )
+            } else {
+                name.clone()
+            };
+            Some((new_name, new_indices))
+        })
+        .collect()
 }
 
 fn similar_size_groups(
@@ -1461,6 +2759,107 @@ mod tests {
     }
 
     #[test]
+    fn parses_xrandr_monitor_names_and_order() {
+        let monitors = parse_xrandr_displays(
+            "Monitors: 2\n 0: +*DP-4 2560/697x1440/392+0+0 DP-4\n 1: +HDMI-0 1920/500x1080/300+2560+0 HDMI-0\n",
+        );
+
+        assert_eq!(
+            monitors,
+            vec![
+                DisplayInfo {
+                    name: "DP-4".to_owned(),
+                    plasma_screen: 0,
+                },
+                DisplayInfo {
+                    name: "HDMI-0".to_owned(),
+                    plasma_screen: 1,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_only_enabled_connected_kscreen_outputs() {
+        let monitors = parse_kscreen_displays(
+            "Output: 1 eDP-1 enabled connected priority 1\nOutput: 2 HDMI-1 disabled connected priority 2\nOutput: 3 DP-1 enabled connected priority 3\n",
+        );
+
+        assert_eq!(
+            monitors,
+            vec![
+                DisplayInfo {
+                    name: "eDP-1".to_owned(),
+                    plasma_screen: 0,
+                },
+                DisplayInfo {
+                    name: "DP-1".to_owned(),
+                    plasma_screen: 1,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_mutter_monitor_array_without_counting_logical_outputs() {
+        let monitors = parse_mutter_displays(
+            "(uint32 4, [('DP-1', 'vendor', 'product', 'serial', [('DP-1', 'vendor', 'product', 'serial')], {}), ('HDMI-1', 'vendor', 'product', 'serial', [('HDMI-1', 'vendor', 'product', 'serial')], {})], [(0, 0, 1.0, uint32 0, true, [('DP-1', 'vendor', 'product', 'serial')])], {})",
+        );
+
+        assert_eq!(
+            monitors
+                .iter()
+                .map(|monitor| monitor.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["DP-1", "HDMI-1"]
+        );
+    }
+
+    #[test]
+    fn file_wallpaper_uri_escapes_path_bytes() {
+        let uri = file_uri(Path::new("/home/user/my image#1.png")).unwrap();
+
+        assert_eq!(uri, "file:///home/user/my%20image%231.png");
+    }
+
+    #[test]
+    fn slideshow_interval_steps_follow_the_requested_schedule() {
+        let intervals = slideshow_intervals();
+
+        assert_eq!(intervals.len(), 48);
+        assert_eq!(intervals[0].label, "5 seconds");
+        assert_eq!(intervals[11].label, "1 minute");
+        assert_eq!(intervals[12].label, "2 minutes");
+        assert_eq!(intervals[40].label, "30 minutes");
+        assert_eq!(intervals[41].label, "1 hour");
+        assert_eq!(intervals[42].label, "6 hours");
+        assert_eq!(intervals[43].label, "12 hours");
+        assert_eq!(intervals[44].label, "1 day");
+        assert_eq!(intervals[45].label, "1 week");
+        assert_eq!(intervals[46].label, "1 month");
+        assert_eq!(intervals[47].label, "1 year");
+    }
+
+    #[test]
+    fn path_config_encoding_preserves_non_utf8_linux_filenames() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', 0xff,
+        ]));
+
+        assert_eq!(path_to_hex(&path), "2f746d702fff");
+    }
+
+    #[test]
+    fn systemd_exec_quoting_escapes_specifiers_and_quotes() {
+        assert_eq!(
+            systemd_quote("/home/user/100% \"photos\""),
+            "\"/home/user/100%% \\\"photos\\\"\""
+        );
+    }
+
+    #[test]
     fn delete_files_removes_selected_files_and_reports_failures() {
         let root = temp_test_root("delete");
         let existing = root.join("selected.jpg");
@@ -1487,7 +2886,7 @@ mod tests {
     }
 
     #[test]
-    fn scanning_folder_defers_image_decoding_until_thumbnail_is_visible() {
+    fn folder_scanning_does_not_decode_image_pixels() {
         let root = temp_test_root("lazy-thumbnail");
         let path = root.join("photo.png");
         image::RgbaImage::new(12, 8).save(&path).unwrap();
@@ -1511,7 +2910,20 @@ mod tests {
     }
 
     #[test]
-    fn selected_file_metadata_includes_type_dimensions_size_and_timestamps() {
+    fn thumbnail_decoder_returns_original_dimensions_and_bounded_pixels() {
+        let root = temp_test_root("thumbnail-decoder");
+        let path = root.join("photo.png");
+        image::RgbaImage::new(12, 8).save(&path).unwrap();
+
+        let decoded = load_thumbnail_image(&path, 4).unwrap();
+
+        assert_eq!(decoded.dimensions, (12, 8));
+        assert_eq!(decoded.image.size, [4, 3]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_file_metadata_includes_type_dimensions_size_and_modified_time() {
         let root = temp_test_root("selected-metadata");
         let path = root.join("photo.png");
         image::RgbaImage::new(12, 8).save(&path).unwrap();
@@ -1535,6 +2947,84 @@ mod tests {
         assert_eq!(metadata.size, format_file_size(file_size));
         assert!(metadata.modified.ends_with('Z'));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_thumbnail_jobs_follow_display_order_and_skip_loaded_images() {
+        let images = ["first.png", "already-loaded.png", "last.png"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ImageEntry {
+                path: PathBuf::from(name),
+                dimensions: None,
+                dimensions_loaded: false,
+                file_size: index as u64,
+                extension: "png".to_owned(),
+                thumbnail: None,
+                thumbnail_loaded: index == 1,
+                thumbnail_error: None,
+            })
+            .collect::<Vec<_>>();
+        let groups = vec![
+            ("Displayed first".to_owned(), vec![2, 1]),
+            ("Displayed second".to_owned(), vec![0]),
+        ];
+
+        let jobs = pending_thumbnail_jobs(&images, &groups);
+
+        assert_eq!(
+            jobs,
+            vec![
+                (2, PathBuf::from("last.png")),
+                (0, PathBuf::from("first.png"))
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_images_do_not_leave_stale_group_indices() {
+        let images = (0..3)
+            .map(|index| ImageEntry {
+                path: PathBuf::from(format!("{index}.png")),
+                dimensions: Some((10, 10)),
+                dimensions_loaded: true,
+                file_size: 100 + index,
+                extension: "png".to_owned(),
+                thumbnail: None,
+                thumbnail_loaded: true,
+                thumbnail_error: None,
+            })
+            .collect::<Vec<_>>();
+        let groups = vec![
+            ("10 × 10".to_owned(), vec![0, 2]),
+            ("Other".to_owned(), vec![1]),
+        ];
+        let index_mapping = [Some(0), None, Some(1)];
+        let remaining = [images[0].path.clone(), images[2].path.clone()];
+        let image_refs: Vec<_> = remaining
+            .iter()
+            .map(|path| ImageEntry {
+                path: path.clone(),
+                dimensions: Some((10, 10)),
+                dimensions_loaded: true,
+                file_size: 100,
+                extension: "png".to_owned(),
+                thumbnail: None,
+                thumbnail_loaded: true,
+                thumbnail_error: None,
+            })
+            .collect();
+
+        let remapped =
+            remap_image_groups(&groups, &index_mapping, &image_refs, GroupMode::Dimensions);
+
+        assert_eq!(remapped, vec![("10 × 10".to_owned(), vec![0, 1])]);
+        assert!(
+            remapped
+                .iter()
+                .flat_map(|(_, indices)| indices)
+                .all(|index| *index < image_refs.len())
+        );
     }
 
     #[test]
