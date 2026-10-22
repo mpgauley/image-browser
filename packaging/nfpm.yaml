@@ -24,7 +24,6 @@ overrides:
   deb:
     depends:
       - libc6
-      - libdav1d5 | libdav1d6 | libdav1d7 | libdav1d8
       - libgtk-3-0 | libgtk-3-0t64
       - libxkbcommon0
       - libwayland-client0
@@ -32,7 +31,6 @@ overrides:
   rpm:
     depends:
       - glibc
-      - dav1d
       - gtk3
       - libxkbcommon
       - wayland
@@ -40,7 +38,6 @@ overrides:
   archlinux:
     depends:
       - glibc
-      - dav1d
       - gtk3
       - libxkbcommon
       - wayland

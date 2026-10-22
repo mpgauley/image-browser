@@ -42,4 +42,4 @@ cargo build --release
 
 The **Linux packages** GitHub Actions workflow builds installable `.deb` packages for Debian and Ubuntu, `.rpm` packages for Fedora and openSUSE, and `.pkg.tar.zst` packages for Arch Linux. Push a version tag such as `v0.1.0` to attach all three packages to its GitHub Release. Builds on `main` and manually started workflow runs publish the packages as downloadable GitHub Actions artifacts.
 
-The packages install the application binary and desktop launcher. Runtime libraries such as GTK 3, dav1d, Wayland, and OpenGL are provided by the distribution package repositories.
+The packages install the application binary and desktop launcher. Runtime libraries such as GTK 3, Wayland, and OpenGL are provided by the distribution package repositories; the workflow statically builds dav1d to avoid distro-specific runtime versions.

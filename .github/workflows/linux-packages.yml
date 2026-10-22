@@ -28,6 +28,9 @@ jobs:
             libwayland-dev \
             libxkbcommon-dev \
             libgl1-mesa-dev \
+            meson \
+            ninja-build \
+            nasm \
             pkg-config
 
       - name: Install Rust
@@ -52,6 +55,8 @@ jobs:
           echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Build application
+        env:
+          SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: always
         run: cargo build --release --locked
 
       - name: Build Debian, RPM, and Arch packages
