@@ -14,8 +14,8 @@ const PREVIEW_MAX_EDGE: u32 = 2048;
 const DUPLICATE_HASH_DISTANCE: u32 = 6;
 const SIMILAR_SIZE_TOLERANCE: f64 = 0.10;
 const GRID_SPACING: f32 = 8.0;
-const GRID_RIGHT_PADDING: f32 = 8.0;
-const CARD_FRAME_HORIZONTAL_MARGIN: f32 = 12.0;
+const GRID_RIGHT_PADDING: f32 = 10.0;
+const CARD_FRAME_HORIZONTAL_MARGIN: f32 = 28.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
@@ -68,6 +68,7 @@ struct ImageBrowserApp {
     path_input: String,
     images: Vec<ImageEntry>,
     selected: HashSet<PathBuf>,
+    selection_anchor: Option<PathBuf>,
     thumbnail_size: f32,
     group_mode: GroupMode,
     preview: Option<Preview>,
@@ -85,6 +86,7 @@ impl ImageBrowserApp {
             current_dir,
             images: Vec::new(),
             selected: HashSet::new(),
+            selection_anchor: None,
             thumbnail_size: 160.0,
             group_mode: GroupMode::None,
             preview: None,
@@ -110,6 +112,7 @@ impl ImageBrowserApp {
                 let count = images.len();
                 self.images = images;
                 self.selected.clear();
+                self.selection_anchor = None;
                 self.status = if skipped > 0 {
                     format!("Loaded {count} images; skipped {skipped} unreadable file(s).")
                 } else {
@@ -328,6 +331,12 @@ impl ImageBrowserApp {
                 let available_width = ui.available_width();
                 let thumbnail_size = fit_thumbnail_size(available_width, self.thumbnail_size);
                 let column_count = grid_column_count(available_width, thumbnail_size);
+                let display_order: Vec<_> = groups
+                    .iter()
+                    .flat_map(|(_, indices)| {
+                        indices.iter().map(|&index| self.images[index].path.clone())
+                    })
+                    .collect();
                 for (group_name, image_indices) in groups {
                     ui.heading(format!("{group_name} ({})", image_indices.len()));
                     ui.add_space(4.0);
@@ -346,11 +355,20 @@ impl ImageBrowserApp {
                             let (clicked, double_clicked) =
                                 draw_image_card(ui, ctx, entry, selected, thumbnail_size);
                             if clicked {
-                                if selected {
-                                    self.selected.remove(&entry.path);
-                                } else {
-                                    self.selected.insert(entry.path.clone());
-                                }
+                                let (shift, toggle) = ctx.input(|input| {
+                                    (
+                                        input.modifiers.shift,
+                                        input.modifiers.ctrl || input.modifiers.command,
+                                    )
+                                });
+                                select_image(
+                                    &mut self.selected,
+                                    &mut self.selection_anchor,
+                                    &display_order,
+                                    &entry.path,
+                                    shift,
+                                    toggle,
+                                );
                             }
                             if double_clicked {
                                 preview_path = Some(entry.path.clone());
@@ -440,9 +458,59 @@ fn fit_thumbnail_size(available_width: f32, requested_size: f32) -> f32 {
 
 fn grid_column_count(available_width: f32, thumbnail_size: f32) -> usize {
     let card_width = thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN;
-    ((available_width - GRID_RIGHT_PADDING + GRID_SPACING) / (card_width + GRID_SPACING))
+    let mut columns = ((available_width - GRID_RIGHT_PADDING + GRID_SPACING)
+        / (card_width + GRID_SPACING))
         .floor()
-        .max(1.0) as usize
+        .max(1.0) as usize;
+    while columns > 1
+        && grid_cards_width(columns, card_width) > available_width - GRID_RIGHT_PADDING
+    {
+        columns -= 1;
+    }
+    columns
+}
+
+fn grid_cards_width(columns: usize, card_width: f32) -> f32 {
+    columns as f32 * card_width + columns.saturating_sub(1) as f32 * GRID_SPACING
+}
+
+fn select_image(
+    selected: &mut HashSet<PathBuf>,
+    anchor: &mut Option<PathBuf>,
+    display_order: &[PathBuf],
+    clicked_path: &Path,
+    shift: bool,
+    toggle: bool,
+) {
+    if shift {
+        let clicked_index = display_order.iter().position(|path| path == clicked_path);
+        let anchor_index = anchor
+            .as_deref()
+            .and_then(|anchor_path| display_order.iter().position(|path| path == anchor_path));
+        if let Some(clicked_index) = clicked_index {
+            let anchor_index = anchor_index.unwrap_or(clicked_index);
+            if !toggle {
+                selected.clear();
+            }
+            for path in
+                &display_order[anchor_index.min(clicked_index)..=anchor_index.max(clicked_index)]
+            {
+                selected.insert(path.clone());
+            }
+            if anchor.is_none() {
+                *anchor = Some(clicked_path.to_path_buf());
+            }
+        }
+    } else if toggle {
+        if !selected.remove(clicked_path) {
+            selected.insert(clicked_path.to_path_buf());
+        }
+        *anchor = Some(clicked_path.to_path_buf());
+    } else {
+        selected.clear();
+        selected.insert(clicked_path.to_path_buf());
+        *anchor = Some(clicked_path.to_path_buf());
+    }
 }
 
 fn supported_extension(extension: &str) -> bool {
@@ -890,8 +958,8 @@ mod tests {
             for requested_size in [80.0, 160.0, 320.0] {
                 let thumbnail_size = fit_thumbnail_size(available_width, requested_size);
                 let columns = grid_column_count(available_width, thumbnail_size);
-                let cards_width = columns as f32 * (thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN)
-                    + (columns - 1) as f32 * GRID_SPACING;
+                let cards_width =
+                    grid_cards_width(columns, thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN);
 
                 assert!(
                     cards_width <= available_width - GRID_RIGHT_PADDING,
@@ -909,6 +977,110 @@ mod tests {
 
         assert_eq!(grid_column_count(available_width, thumbnail_size), 1);
         assert!(card_width <= available_width - GRID_RIGHT_PADDING);
+    }
+
+    #[test]
+    fn grid_reduces_columns_when_right_margin_would_be_under_ten_pixels() {
+        let card_width = 160.0 + CARD_FRAME_HORIZONTAL_MARGIN;
+        let available_width = 3.0 * card_width + 2.0 * GRID_SPACING + GRID_RIGHT_PADDING - 0.5;
+        let thumbnail_size = fit_thumbnail_size(available_width, 160.0);
+        let columns = grid_column_count(available_width, thumbnail_size);
+        let right_margin = available_width
+            - grid_cards_width(columns, thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN);
+
+        assert_eq!(columns, 2);
+        assert!(right_margin >= 10.0);
+    }
+
+    #[test]
+    fn plain_click_replaces_selection_and_control_click_toggles() {
+        let order = vec![
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.jpg"),
+        ];
+        let mut selected = HashSet::from([PathBuf::from("a.jpg")]);
+        let mut anchor = Some(PathBuf::from("a.jpg"));
+
+        select_image(
+            &mut selected,
+            &mut anchor,
+            &order,
+            Path::new("b.jpg"),
+            false,
+            false,
+        );
+        assert_eq!(selected, HashSet::from([PathBuf::from("b.jpg")]));
+
+        select_image(
+            &mut selected,
+            &mut anchor,
+            &order,
+            Path::new("c.jpg"),
+            false,
+            true,
+        );
+        assert_eq!(
+            selected,
+            HashSet::from([PathBuf::from("b.jpg"), PathBuf::from("c.jpg")])
+        );
+
+        select_image(
+            &mut selected,
+            &mut anchor,
+            &order,
+            Path::new("b.jpg"),
+            false,
+            true,
+        );
+        assert_eq!(selected, HashSet::from([PathBuf::from("c.jpg")]));
+    }
+
+    #[test]
+    fn shift_click_selects_a_range_and_control_shift_adds_a_range() {
+        let order = vec![
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.jpg"),
+            PathBuf::from("d.jpg"),
+        ];
+        let mut selected = HashSet::from([PathBuf::from("a.jpg")]);
+        let mut anchor = Some(PathBuf::from("a.jpg"));
+
+        select_image(
+            &mut selected,
+            &mut anchor,
+            &order,
+            Path::new("c.jpg"),
+            true,
+            false,
+        );
+        assert_eq!(
+            selected,
+            HashSet::from([
+                PathBuf::from("a.jpg"),
+                PathBuf::from("b.jpg"),
+                PathBuf::from("c.jpg"),
+            ])
+        );
+
+        select_image(
+            &mut selected,
+            &mut anchor,
+            &order,
+            Path::new("d.jpg"),
+            true,
+            true,
+        );
+        assert_eq!(
+            selected,
+            HashSet::from([
+                PathBuf::from("a.jpg"),
+                PathBuf::from("b.jpg"),
+                PathBuf::from("c.jpg"),
+                PathBuf::from("d.jpg"),
+            ])
+        );
     }
 
     #[test]
