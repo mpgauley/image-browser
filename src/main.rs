@@ -114,6 +114,15 @@ struct TaskProgress {
     total: usize,
 }
 
+struct SelectedFileMetadata {
+    path: PathBuf,
+    file_type: String,
+    dimensions: String,
+    size: String,
+    created: String,
+    modified: String,
+}
+
 struct Preview {
     path: PathBuf,
     texture: Option<TextureHandle>,
@@ -751,16 +760,59 @@ impl ImageBrowserApp {
             self.confirm_delete = false;
         }
     }
-}
 
-impl eframe::App for ImageBrowserApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_background_task(ctx);
-        self.draw_top_panel(ctx);
-        self.draw_image_grid(ctx);
-        self.draw_preview(ctx);
-        self.draw_delete_confirmation(ctx);
+    fn draw_selected_metadata(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("selected-metadata")
+            .resizable(true)
+            .default_height(164.0)
+            .min_height(88.0)
+            .max_height(280.0)
+            .show(ctx, |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading(format!("Selected file metadata ({})", self.selected.len()));
+                    if self.selected.is_empty() {
+                        ui.label("Select an image to view its metadata.");
+                        return;
+                    }
 
+                    let mut selected_paths: Vec<_> = self.selected.iter().cloned().collect();
+                    selected_paths.sort();
+                    egui::ScrollArea::vertical()
+                        .max_height(ui.available_height())
+                        .show(ui, |ui| {
+                            egui::Grid::new("selected-file-metadata")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for path in selected_paths {
+                                        let Some(entry) =
+                                            self.images.iter_mut().find(|entry| entry.path == path)
+                                        else {
+                                            continue;
+                                        };
+                                        let metadata = selected_file_metadata(entry);
+                                        ui.strong(
+                                            metadata
+                                                .path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy(),
+                                        );
+                                        ui.label(&metadata.file_type);
+                                        ui.end_row();
+                                        metadata_row(ui, "Dimensions", &metadata.dimensions);
+                                        metadata_row(ui, "Size", &metadata.size);
+                                        metadata_row(ui, "Date created", &metadata.created);
+                                        metadata_row(ui, "Date modified", &metadata.modified);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+            });
+    }
+
+    fn draw_status_panel(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
@@ -793,6 +845,18 @@ impl eframe::App for ImageBrowserApp {
                 }
             });
         });
+    }
+}
+
+impl eframe::App for ImageBrowserApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_task(ctx);
+        self.draw_top_panel(ctx);
+        self.draw_status_panel(ctx);
+        self.draw_selected_metadata(ctx);
+        self.draw_image_grid(ctx);
+        self.draw_preview(ctx);
+        self.draw_delete_confirmation(ctx);
     }
 }
 
@@ -1038,31 +1102,6 @@ fn draw_image_card(
                 },
             );
         });
-    ui.horizontal(|ui| {
-        let file_type = if entry.extension.is_empty() {
-            "Unknown file type".to_owned()
-        } else {
-            format!(".{}", entry.extension.to_uppercase())
-        };
-        let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
-        let name_response = ui
-            .add_sized(
-                [thumbnail_size - 48.0, ui.spacing().interact_size.y],
-                egui::Label::new(name)
-                    .truncate()
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(entry.path.display().to_string());
-        clicked |= name_response.clicked();
-        double_clicked |= name_response.double_clicked();
-        ui.small(file_type);
-    });
-    match entry.dimensions {
-        Some((width, height)) => ui.small(format!("{width} × {height}")),
-        None if entry.dimensions_loaded => ui.small("Unknown dimensions"),
-        None => ui.small("Dimensions pending"),
-    };
-    ui.small(format_file_size(entry.file_size));
     (clicked, double_clicked)
 }
 
@@ -1219,6 +1258,54 @@ fn group_images(
         hashes,
         failed,
     }
+}
+
+fn selected_file_metadata(entry: &mut ImageEntry) -> SelectedFileMetadata {
+    if !entry.dimensions_loaded {
+        entry.dimensions = image::image_dimensions(&entry.path).ok();
+        entry.dimensions_loaded = true;
+    }
+    let metadata = fs::metadata(&entry.path);
+    let created = metadata
+        .as_ref()
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
+        .map(format_system_time)
+        .unwrap_or_else(|| "Unavailable".to_owned());
+    let modified = metadata
+        .as_ref()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(format_system_time)
+        .unwrap_or_else(|| "Unavailable".to_owned());
+    let file_type = if entry.extension.is_empty() {
+        "Unknown".to_owned()
+    } else {
+        format!(".{}", entry.extension.to_uppercase())
+    };
+    let dimensions = entry
+        .dimensions
+        .map(|(width, height)| format!("{width} × {height}"))
+        .unwrap_or_else(|| "Unavailable".to_owned());
+
+    SelectedFileMetadata {
+        path: entry.path.clone(),
+        file_type,
+        dimensions,
+        size: format_file_size(entry.file_size),
+        created,
+        modified,
+    }
+}
+
+fn format_system_time(timestamp: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(timestamp)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn metadata_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(label);
+    ui.label(value);
 }
 
 fn group_by_key(images: &[GroupingImage], key: impl Fn(&GroupingImage) -> String) -> ImageGroups {
@@ -1556,6 +1643,34 @@ mod tests {
         assert_eq!(images[0].path, path);
         assert_eq!(images[0].file_size, fs::metadata(&path).unwrap().len());
         assert_eq!(progress.last(), Some(&(1, 1)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_file_metadata_includes_type_dimensions_size_and_timestamps() {
+        let root = temp_test_root("selected-metadata");
+        let path = root.join("photo.png");
+        image::RgbaImage::new(12, 8).save(&path).unwrap();
+        let file_size = fs::metadata(&path).unwrap().len();
+        let mut entry = ImageEntry {
+            path: path.clone(),
+            dimensions: None,
+            dimensions_loaded: false,
+            file_size,
+            extension: "png".to_owned(),
+            thumbnail: None,
+            thumbnail_loaded: false,
+            thumbnail_error: None,
+            perceptual_hash: None,
+        };
+
+        let metadata = selected_file_metadata(&mut entry);
+
+        assert_eq!(metadata.path.file_name().unwrap(), "photo.png");
+        assert_eq!(metadata.file_type, ".PNG");
+        assert_eq!(metadata.dimensions, "12 × 8");
+        assert_eq!(metadata.size, format_file_size(file_size));
+        assert!(metadata.modified.ends_with('Z'));
         fs::remove_dir_all(root).unwrap();
     }
 
