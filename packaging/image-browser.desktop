@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Image Browser
+Comment=Browse and organize image collections
+Exec=image-browser
+Terminal=false
+Categories=Graphics;Viewer;
+StartupNotify=true

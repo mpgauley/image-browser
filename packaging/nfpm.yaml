@@ -1,0 +1,47 @@
+name: image-browser
+arch: amd64
+platform: linux
+version: ${PACKAGE_VERSION}
+section: graphics
+priority: optional
+maintainer: mpgauley
+description: A Linux desktop file browser focused on images
+vendor: mpgauley
+homepage: https://github.com/mpgauley/image-browser
+license: Apache-2.0
+
+contents:
+  - src: ./target/release/image-browser
+    dst: /usr/bin/image-browser
+    file_info:
+      mode: 0755
+  - src: ./packaging/image-browser.desktop
+    dst: /usr/share/applications/image-browser.desktop
+    file_info:
+      mode: 0644
+
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libdav1d5 | libdav1d6 | libdav1d7 | libdav1d8
+      - libgtk-3-0 | libgtk-3-0t64
+      - libxkbcommon0
+      - libwayland-client0
+      - libgl1
+  rpm:
+    depends:
+      - glibc
+      - dav1d
+      - gtk3
+      - libxkbcommon
+      - wayland
+      - mesa-libGL
+  archlinux:
+    depends:
+      - glibc
+      - dav1d
+      - gtk3
+      - libxkbcommon
+      - wayland
+      - mesa
