@@ -12,5 +12,6 @@
 
 ### Changed
 
+- Updated GitHub Actions dependencies to Node.js 24-compatible releases.
 - Removed the creation date from selected-file metadata; the modification date remains.
 - Updated the README with wallpaper, slideshow, and runtime requirements.
