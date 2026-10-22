@@ -13,6 +13,9 @@ const THUMBNAIL_MAX_EDGE: u32 = 512;
 const PREVIEW_MAX_EDGE: u32 = 2048;
 const DUPLICATE_HASH_DISTANCE: u32 = 6;
 const SIMILAR_SIZE_TOLERANCE: f64 = 0.10;
+const GRID_SPACING: f32 = 8.0;
+const GRID_RIGHT_PADDING: f32 = 8.0;
+const CARD_FRAME_HORIZONTAL_MARGIN: f32 = 12.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
@@ -322,38 +325,41 @@ impl ImageBrowserApp {
                 }
 
                 let mut preview_path = None;
-                let card_width = self.thumbnail_size + 32.0;
                 let available_width = ui.available_width();
-                let column_count = ((available_width + 8.0) / (card_width + 8.0))
-                    .floor()
-                    .max(1.0) as usize;
+                let thumbnail_size = fit_thumbnail_size(available_width, self.thumbnail_size);
+                let column_count = grid_column_count(available_width, thumbnail_size);
                 for (group_name, image_indices) in groups {
                     ui.heading(format!("{group_name} ({})", image_indices.len()));
                     ui.add_space(4.0);
-                    egui::Grid::new(("image-grid", &group_name))
-                        .num_columns(column_count)
-                        .spacing(egui::vec2(8.0, 8.0))
-                        .show(ui, |ui| {
-                            for (position, index) in image_indices.into_iter().enumerate() {
-                                let entry = &mut self.images[index];
-                                let selected = self.selected.contains(&entry.path);
-                                let (clicked, double_clicked) =
-                                    draw_image_card(ui, ctx, entry, selected, self.thumbnail_size);
-                                if clicked {
-                                    if selected {
-                                        self.selected.remove(&entry.path);
-                                    } else {
-                                        self.selected.insert(entry.path.clone());
-                                    }
-                                }
-                                if double_clicked {
-                                    preview_path = Some(entry.path.clone());
-                                }
-                                if (position + 1) % column_count == 0 {
-                                    ui.end_row();
+                    egui::Grid::new((
+                        "image-grid",
+                        &group_name,
+                        column_count,
+                        thumbnail_size.to_bits(),
+                    ))
+                    .num_columns(column_count)
+                    .spacing(egui::vec2(GRID_SPACING, GRID_SPACING))
+                    .show(ui, |ui| {
+                        for (position, index) in image_indices.into_iter().enumerate() {
+                            let entry = &mut self.images[index];
+                            let selected = self.selected.contains(&entry.path);
+                            let (clicked, double_clicked) =
+                                draw_image_card(ui, ctx, entry, selected, thumbnail_size);
+                            if clicked {
+                                if selected {
+                                    self.selected.remove(&entry.path);
+                                } else {
+                                    self.selected.insert(entry.path.clone());
                                 }
                             }
-                        });
+                            if double_clicked {
+                                preview_path = Some(entry.path.clone());
+                            }
+                            if (position + 1) % column_count == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
                     ui.add_space(12.0);
                 }
                 if let Some(path) = preview_path {
@@ -424,6 +430,19 @@ impl eframe::App for ImageBrowserApp {
             });
         });
     }
+}
+
+fn fit_thumbnail_size(available_width: f32, requested_size: f32) -> f32 {
+    (available_width - GRID_RIGHT_PADDING - CARD_FRAME_HORIZONTAL_MARGIN)
+        .max(1.0)
+        .min(requested_size)
+}
+
+fn grid_column_count(available_width: f32, thumbnail_size: f32) -> usize {
+    let card_width = thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN;
+    ((available_width - GRID_RIGHT_PADDING + GRID_SPACING) / (card_width + GRID_SPACING))
+        .floor()
+        .max(1.0) as usize
 }
 
 fn supported_extension(extension: &str) -> bool {
@@ -863,6 +882,33 @@ mod tests {
             thumbnail: None,
             perceptual_hash: Some(hash),
         }
+    }
+
+    #[test]
+    fn grid_columns_fit_within_the_available_width() {
+        for available_width in [120.0, 240.0, 640.0, 1024.0, 1920.0] {
+            for requested_size in [80.0, 160.0, 320.0] {
+                let thumbnail_size = fit_thumbnail_size(available_width, requested_size);
+                let columns = grid_column_count(available_width, thumbnail_size);
+                let cards_width = columns as f32 * (thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN)
+                    + (columns - 1) as f32 * GRID_SPACING;
+
+                assert!(
+                    cards_width <= available_width - GRID_RIGHT_PADDING,
+                    "{columns} cards of width {thumbnail_size} exceed {available_width}px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_windows_shrink_thumbnails_to_keep_cards_visible() {
+        let available_width = 120.0;
+        let thumbnail_size = fit_thumbnail_size(available_width, 160.0);
+        let card_width = thumbnail_size + CARD_FRAME_HORIZONTAL_MARGIN;
+
+        assert_eq!(grid_column_count(available_width, thumbnail_size), 1);
+        assert!(card_width <= available_width - GRID_RIGHT_PADDING);
     }
 
     #[test]
