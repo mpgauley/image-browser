@@ -726,31 +726,31 @@ fn draw_image_card(
                     },
                 );
             }
-            let file_type = if entry.extension.is_empty() {
-                "Unknown file type".to_owned()
-            } else {
-                format!(".{}", entry.extension.to_uppercase())
-            };
-            ui.horizontal(|ui| {
-                let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
-                let name_response = ui
-                    .add_sized(
-                        [thumbnail_size - 48.0, ui.spacing().interact_size.y],
-                        egui::Label::new(name)
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(entry.path.display().to_string());
-                clicked |= name_response.clicked();
-                double_clicked |= name_response.double_clicked();
-                ui.small(file_type);
-            });
-            match entry.dimensions {
-                Some((width, height)) => ui.small(format!("{width} × {height}")),
-                None => ui.small("Unknown dimensions"),
-            };
-            ui.small(format_file_size(entry.file_size));
         });
+    ui.horizontal(|ui| {
+        let file_type = if entry.extension.is_empty() {
+            "Unknown file type".to_owned()
+        } else {
+            format!(".{}", entry.extension.to_uppercase())
+        };
+        let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
+        let name_response = ui
+            .add_sized(
+                [thumbnail_size - 48.0, ui.spacing().interact_size.y],
+                egui::Label::new(name)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(entry.path.display().to_string());
+        clicked |= name_response.clicked();
+        double_clicked |= name_response.double_clicked();
+        ui.small(file_type);
+    });
+    match entry.dimensions {
+        Some((width, height)) => ui.small(format!("{width} × {height}")),
+        None => ui.small("Unknown dimensions"),
+    };
+    ui.small(format_file_size(entry.file_size));
     (clicked, double_clicked)
 }
 
