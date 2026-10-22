@@ -73,7 +73,7 @@ struct ImageBrowserApp {
 
 impl ImageBrowserApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let current_dir = std::env::current_dir().ok();
+        let current_dir = default_directory();
         let mut app = Self {
             path_input: current_dir
                 .as_ref()
@@ -91,7 +91,7 @@ impl ImageBrowserApp {
         if app.current_dir.is_some() {
             app.refresh();
         } else {
-            app.status = "Could not determine the current directory.".to_owned();
+            app.status = "Could not determine the current user's home directory.".to_owned();
         }
         app
     }
@@ -443,6 +443,17 @@ fn supported_extension(extension: &str) -> bool {
     )
 }
 
+fn default_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            std::env::var_os("USER")
+                .map(|username| PathBuf::from("/home").join(username))
+                .filter(|path| path.is_dir())
+        })
+}
+
 fn scan_directory(directory: &Path) -> Result<(Vec<ImageEntry>, usize)> {
     let entries =
         fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?;
@@ -522,20 +533,27 @@ fn draw_image_card(
         })
         .show(ui, |ui| {
             ui.set_width(thumbnail_size + 20.0);
+            let thumbnail_area = egui::vec2(thumbnail_size, thumbnail_size);
             if let Some(texture) = &entry.thumbnail {
                 let texture_size = texture.size_vec2();
                 let factor = (thumbnail_size / texture_size.x).min(thumbnail_size / texture_size.y);
                 let size = texture_size * factor;
-                let response = ui.add(
-                    egui::Image::new(texture)
-                        .fit_to_exact_size(size)
-                        .sense(egui::Sense::click()),
+                ui.allocate_ui_with_layout(
+                    thumbnail_area,
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        let response = ui.add(
+                            egui::Image::new(texture)
+                                .fit_to_exact_size(size)
+                                .sense(egui::Sense::click()),
+                        );
+                        clicked = response.clicked();
+                        double_clicked = response.double_clicked();
+                    },
                 );
-                clicked = response.clicked();
-                double_clicked = response.double_clicked();
             } else {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(thumbnail_size, thumbnail_size),
+                    thumbnail_area,
                     egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                     |ui| {
                         ui.label("Preview unavailable");
