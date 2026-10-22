@@ -8,6 +8,7 @@ A Linux desktop file browser built with Rust, focused on quickly browsing and or
 - Increase or decrease thumbnail size.
 - Group images by dimensions, approximate file size (within 10%), visual similarity, or file type.
 - Select multiple images and copy or move them to another folder.
+- Delete selected images after confirming the permanent deletion.
 - Existing files are never overwritten: copies and moves receive a numbered name when needed.
 
 Visual duplicate groups use a difference hash and are intended to find possible lookalikes, not prove that files are identical. Hashing is performed when that grouping is selected.

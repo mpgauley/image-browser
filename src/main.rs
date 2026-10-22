@@ -69,6 +69,7 @@ struct ImageBrowserApp {
     images: Vec<ImageEntry>,
     selected: HashSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
+    confirm_delete: bool,
     thumbnail_size: f32,
     group_mode: GroupMode,
     preview: Option<Preview>,
@@ -87,6 +88,7 @@ impl ImageBrowserApp {
             images: Vec::new(),
             selected: HashSet::new(),
             selection_anchor: None,
+            confirm_delete: false,
             thumbnail_size: 160.0,
             group_mode: GroupMode::None,
             preview: None,
@@ -213,6 +215,34 @@ impl ImageBrowserApp {
         };
     }
 
+    fn delete_selected(&mut self) {
+        if self.selected.is_empty() {
+            self.status = "Select one or more images first.".to_owned();
+            return;
+        }
+
+        let selected: Vec<_> = self.selected.iter().cloned().collect();
+        let (deleted, failures) = delete_files(&selected);
+        self.images.retain(|entry| !deleted.contains(&entry.path));
+        self.selected.retain(|path| !deleted.contains(path));
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|path| deleted.contains(path))
+        {
+            self.selection_anchor = None;
+        }
+        self.status = match (deleted.len(), failures.is_empty()) {
+            (count, true) => format!("Deleted {count} image(s)."),
+            (0, false) => format!("No images were deleted. {}", failures.join(" | ")),
+            (count, false) => format!(
+                "Deleted {count} image(s); {} failed: {}",
+                failures.len(),
+                failures.join(" | ")
+            ),
+        };
+    }
+
     fn image_groups(&self) -> Vec<(String, Vec<usize>)> {
         match self.group_mode {
             GroupMode::None => vec![("Images".to_owned(), (0..self.images.len()).collect())],
@@ -302,6 +332,12 @@ impl ImageBrowserApp {
                 }
                 if ui.button("Move to…").clicked() {
                     self.copy_or_move_selected(true);
+                }
+                if ui
+                    .add_enabled(!self.selected.is_empty(), egui::Button::new("Delete…"))
+                    .clicked()
+                {
+                    self.confirm_delete = true;
                 }
             });
         });
@@ -430,6 +466,37 @@ impl ImageBrowserApp {
             self.preview = None;
         }
     }
+
+    fn draw_delete_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_delete {
+            return;
+        }
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("confirm-delete")).show(ctx, |ui| {
+            ui.heading("Delete selected images?");
+            ui.label(format!(
+                "This permanently deletes {} image(s).",
+                self.selected.len()
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.button("Delete").clicked() {
+                    confirm = true;
+                }
+            });
+        });
+
+        if confirm {
+            self.confirm_delete = false;
+            self.delete_selected();
+        } else if cancel || response.should_close() {
+            self.confirm_delete = false;
+        }
+    }
 }
 
 impl eframe::App for ImageBrowserApp {
@@ -437,6 +504,7 @@ impl eframe::App for ImageBrowserApp {
         self.draw_top_panel(ctx);
         self.draw_image_grid(ctx);
         self.draw_preview(ctx);
+        self.draw_delete_confirmation(ctx);
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -668,6 +736,12 @@ fn draw_image_card(
                 .on_hover_text(entry.path.display().to_string());
             clicked |= label_response.clicked();
             double_clicked |= label_response.double_clicked();
+            let file_type = if entry.extension.is_empty() {
+                "Unknown file type".to_owned()
+            } else {
+                format!(".{}", entry.extension.to_uppercase())
+            };
+            ui.small(file_type);
             let detail = match entry.dimensions {
                 Some((width, height)) => {
                     format!("{width} × {height} · {}", format_file_size(entry.file_size))
@@ -700,6 +774,23 @@ fn group_by_key(
         groups.entry(key(entry)).or_default().push(index);
     }
     groups.into_iter().collect()
+}
+
+fn delete_files(paths: &[PathBuf]) -> (HashSet<PathBuf>, Vec<String>) {
+    let mut deleted = HashSet::new();
+    let mut failures = Vec::new();
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                deleted.insert(path.clone());
+            }
+            Err(error) => failures.push(format!(
+                "{}: {error}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )),
+        }
+    }
+    (deleted, failures)
 }
 
 fn similar_size_groups(images: &[ImageEntry]) -> Vec<(String, Vec<usize>)> {
@@ -939,6 +1030,22 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn delete_files_removes_selected_files_and_reports_failures() {
+        let root = temp_test_root("delete");
+        let existing = root.join("selected.jpg");
+        let missing = root.join("missing.jpg");
+        fs::write(&existing, b"image").unwrap();
+
+        let (deleted, failures) = delete_files(&[existing.clone(), missing]);
+
+        assert_eq!(deleted, HashSet::from([existing.clone()]));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("missing.jpg"));
+        assert!(!existing.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn image_entry(name: &str, size: u64, hash: Option<u64>) -> ImageEntry {
