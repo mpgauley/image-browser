@@ -51,9 +51,12 @@ impl GroupMode {
 struct ImageEntry {
     path: PathBuf,
     dimensions: Option<(u32, u32)>,
+    dimensions_loaded: bool,
     file_size: u64,
     extension: String,
     thumbnail: Option<TextureHandle>,
+    thumbnail_loaded: bool,
+    thumbnail_error: Option<String>,
     perceptual_hash: Option<Option<u64>>,
 }
 
@@ -133,7 +136,21 @@ impl ImageBrowserApp {
 
     fn set_group_mode(&mut self, mode: GroupMode) {
         self.group_mode = mode;
-        if mode == GroupMode::Duplicates {
+        if mode == GroupMode::Dimensions {
+            let mut failed = 0;
+            for entry in &mut self.images {
+                if !entry.dimensions_loaded {
+                    entry.dimensions = image::image_dimensions(&entry.path).ok();
+                    entry.dimensions_loaded = true;
+                    failed += usize::from(entry.dimensions.is_none());
+                }
+            }
+            self.status = if failed == 0 {
+                "Grouped images by dimensions.".to_owned()
+            } else {
+                format!("Could not read dimensions for {failed} image(s).")
+            };
+        } else if mode == GroupMode::Duplicates {
             let mut failed = 0;
             for entry in &mut self.images {
                 if entry.perceptual_hash.is_none() {
@@ -654,13 +671,15 @@ fn scan_directory(directory: &Path) -> Result<(Vec<ImageEntry>, usize)> {
                 continue;
             }
         };
-        let dimensions = image::image_dimensions(&path).ok();
         images.push(ImageEntry {
             path,
-            dimensions,
+            dimensions: None,
+            dimensions_loaded: false,
             file_size: metadata.len(),
             extension,
             thumbnail: None,
+            thumbnail_loaded: false,
+            thumbnail_error: None,
             perceptual_hash: None,
         });
     }
@@ -683,12 +702,6 @@ fn draw_image_card(
     selected: bool,
     thumbnail_size: f32,
 ) -> (bool, bool) {
-    if entry.thumbnail.is_none()
-        && let Ok(texture) = load_texture(ctx, &entry.path, THUMBNAIL_MAX_EDGE)
-    {
-        entry.thumbnail = Some(texture);
-    }
-
     let mut clicked = false;
     let mut double_clicked = false;
     egui::Frame::group(ui.style())
@@ -700,14 +713,29 @@ fn draw_image_card(
         .show(ui, |ui| {
             ui.set_width(thumbnail_size + 16.0);
             let thumbnail_area = egui::vec2(thumbnail_size, thumbnail_size);
-            if let Some(texture) = &entry.thumbnail {
-                let texture_size = texture.size_vec2();
-                let factor = (thumbnail_size / texture_size.x).min(thumbnail_size / texture_size.y);
-                let size = texture_size * factor;
-                ui.allocate_ui_with_layout(
-                    thumbnail_area,
-                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                    |ui| {
+            ui.allocate_ui_with_layout(
+                thumbnail_area,
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    if !entry.thumbnail_loaded && ui.is_rect_visible(ui.max_rect()) {
+                        entry.thumbnail_loaded = true;
+                        match load_thumbnail(ctx, &entry.path, THUMBNAIL_MAX_EDGE) {
+                            Ok((texture, dimensions)) => {
+                                entry.thumbnail = Some(texture);
+                                entry.dimensions = Some(dimensions);
+                                entry.dimensions_loaded = true;
+                            }
+                            Err(error) => {
+                                entry.dimensions_loaded = true;
+                                entry.thumbnail_error = Some(format!("{error:#}"));
+                            }
+                        }
+                    }
+                    if let Some(texture) = &entry.thumbnail {
+                        let texture_size = texture.size_vec2();
+                        let factor =
+                            (thumbnail_size / texture_size.x).min(thumbnail_size / texture_size.y);
+                        let size = texture_size * factor;
                         let response = ui.add(
                             egui::Image::new(texture)
                                 .fit_to_exact_size(size)
@@ -715,17 +743,12 @@ fn draw_image_card(
                         );
                         clicked = response.clicked();
                         double_clicked = response.double_clicked();
-                    },
-                );
-            } else {
-                ui.allocate_ui_with_layout(
-                    thumbnail_area,
-                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                    |ui| {
-                        ui.label("Preview unavailable");
-                    },
-                );
-            }
+                    } else if entry.thumbnail_loaded {
+                        let error = entry.thumbnail_error.as_deref().unwrap_or("Unknown error");
+                        ui.label("Preview unavailable").on_hover_text(error);
+                    }
+                },
+            );
         });
     ui.horizontal(|ui| {
         let file_type = if entry.extension.is_empty() {
@@ -748,7 +771,8 @@ fn draw_image_card(
     });
     match entry.dimensions {
         Some((width, height)) => ui.small(format!("{width} × {height}")),
-        None => ui.small("Unknown dimensions"),
+        None if entry.dimensions_loaded => ui.small("Unknown dimensions"),
+        None => ui.small("Dimensions pending"),
     };
     ui.small(format_file_size(entry.file_size));
     (clicked, double_clicked)
@@ -756,6 +780,26 @@ fn draw_image_card(
 
 fn load_texture(ctx: &egui::Context, path: &Path, max_edge: u32) -> Result<TextureHandle> {
     let image = image::open(path).with_context(|| format!("decoding {}", path.display()))?;
+    texture_from_image(ctx, path, &image, max_edge)
+}
+
+fn load_thumbnail(
+    ctx: &egui::Context,
+    path: &Path,
+    max_edge: u32,
+) -> Result<(TextureHandle, (u32, u32))> {
+    let image = image::open(path).with_context(|| format!("decoding {}", path.display()))?;
+    let dimensions = (image.width(), image.height());
+    let texture = texture_from_image(ctx, path, &image, max_edge)?;
+    Ok((texture, dimensions))
+}
+
+fn texture_from_image(
+    ctx: &egui::Context,
+    path: &Path,
+    image: &image::DynamicImage,
+    max_edge: u32,
+) -> Result<TextureHandle> {
     let thumbnail = image.thumbnail(max_edge, max_edge).to_rgba8();
     let size = [thumbnail.width() as usize, thumbnail.height() as usize];
     let color_image = ColorImage::from_rgba_unmultiplied(size, thumbnail.as_raw());
@@ -1053,11 +1097,31 @@ mod tests {
         ImageEntry {
             path: PathBuf::from(name),
             dimensions: Some((640, 480)),
+            dimensions_loaded: true,
             file_size: size,
             extension: "jpg".to_owned(),
             thumbnail: None,
+            thumbnail_loaded: false,
+            thumbnail_error: None,
             perceptual_hash: Some(hash),
         }
+    }
+
+    #[test]
+    fn scanning_folder_defers_image_decoding_until_thumbnail_is_visible() {
+        let root = temp_test_root("lazy-thumbnail");
+        let path = root.join("photo.png");
+        image::RgbaImage::new(12, 8).save(&path).unwrap();
+
+        let (images, skipped) = scan_directory(&root).unwrap();
+
+        assert_eq!(skipped, 0);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].dimensions, None);
+        assert!(!images[0].dimensions_loaded);
+        assert!(images[0].thumbnail.is_none());
+        assert!(!images[0].thumbnail_loaded);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

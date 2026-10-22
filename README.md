@@ -5,6 +5,7 @@ A Linux desktop file browser built with Rust, focused on quickly browsing and or
 ## Features
 
 - Browse image files in a folder and open a larger preview by double-clicking a thumbnail.
+- Load image pixels and thumbnails lazily as cards enter the visible viewport.
 - Increase or decrease thumbnail size.
 - Group images by dimensions, approximate file size (within 10%), visual similarity, or file type.
 - Select multiple images and copy or move them to another folder.
