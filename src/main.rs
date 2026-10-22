@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -14,11 +14,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
-use image::imageops::FilterType;
 
 const THUMBNAIL_MAX_EDGE: u32 = 512;
 const PREVIEW_MAX_EDGE: u32 = 2048;
-const DUPLICATE_HASH_DISTANCE: u32 = 6;
 const SIMILAR_SIZE_TOLERANCE: f64 = 0.10;
 const GRID_SPACING: f32 = 8.0;
 const GRID_RIGHT_PADDING: f32 = 10.0;
@@ -39,7 +37,6 @@ enum GroupMode {
     None,
     Dimensions,
     SimilarSize,
-    Duplicates,
     FileType,
 }
 
@@ -49,7 +46,6 @@ impl GroupMode {
             Self::None => "All images",
             Self::Dimensions => "Dimensions",
             Self::SimilarSize => "Similar file size",
-            Self::Duplicates => "Possible duplicates",
             Self::FileType => "File type",
         }
     }
@@ -64,7 +60,6 @@ struct ImageEntry {
     thumbnail: Option<TextureHandle>,
     thumbnail_loaded: bool,
     thumbnail_error: Option<String>,
-    perceptual_hash: Option<Option<u64>>,
 }
 
 struct ScannedImage {
@@ -79,13 +74,11 @@ struct GroupingImage {
     dimensions_loaded: bool,
     file_size: u64,
     extension: String,
-    perceptual_hash: Option<Option<u64>>,
 }
 
 struct GroupingResult {
     groups: ImageGroups,
     dimensions: Vec<(usize, Option<(u32, u32)>)>,
-    hashes: Vec<(usize, Option<u64>)>,
     failed: usize,
 }
 
@@ -226,7 +219,6 @@ impl ImageBrowserApp {
                 dimensions_loaded: entry.dimensions_loaded,
                 file_size: entry.file_size,
                 extension: entry.extension.clone(),
-                perceptual_hash: entry.perceptual_hash,
             })
             .collect();
         self.grouped_images = None;
@@ -360,7 +352,6 @@ impl ImageBrowserApp {
                         thumbnail: None,
                         thumbnail_loaded: false,
                         thumbnail_error: None,
-                        perceptual_hash: None,
                     })
                     .collect();
                 self.selected.clear();
@@ -392,11 +383,6 @@ impl ImageBrowserApp {
                     if let Some(entry) = self.images.get_mut(index) {
                         entry.dimensions = dimensions;
                         entry.dimensions_loaded = true;
-                    }
-                }
-                for (index, hash) in result.hashes {
-                    if let Some(entry) = self.images.get_mut(index) {
-                        entry.perceptual_hash = Some(hash);
                     }
                 }
                 self.grouped_images = Some(Arc::new(result.groups));
@@ -551,7 +537,6 @@ impl ImageBrowserApp {
                         GroupMode::None,
                         GroupMode::Dimensions,
                         GroupMode::SimilarSize,
-                        GroupMode::Duplicates,
                         GroupMode::FileType,
                     ] {
                         if ui
@@ -1173,7 +1158,6 @@ fn group_images(
 ) -> GroupingResult {
     let count = images.len();
     let mut dimensions = Vec::new();
-    let mut hashes = Vec::new();
     let mut failed = 0;
 
     let groups = match mode {
@@ -1221,41 +1205,11 @@ fn group_images(
             grouped.into_iter().collect()
         }
         GroupMode::SimilarSize => similar_size_groups(&images, &sender, &cancel),
-        GroupMode::Duplicates => {
-            let pair_count = images
-                .iter()
-                .enumerate()
-                .filter(|(_, image)| image.perceptual_hash.flatten().is_some())
-                .map(|(index, _)| count.saturating_sub(index + 1))
-                .sum::<usize>();
-            let total = count.saturating_add(pair_count);
-            send_progress(&sender, 0, total, &cancel);
-            for (index, entry) in images.iter_mut().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                if entry.perceptual_hash.is_none() {
-                    entry.perceptual_hash = match perceptual_hash(&entry.path) {
-                        Ok(hash) => Some(Some(hash)),
-                        Err(_) => {
-                            failed += 1;
-                            Some(None)
-                        }
-                    };
-                    hashes.push((index, entry.perceptual_hash.flatten()));
-                }
-                if index % 8 == 0 || index + 1 == count {
-                    send_progress(&sender, index + 1, total, &cancel);
-                }
-            }
-            duplicate_groups(&images, &sender, &cancel, count, total)
-        }
     };
 
     GroupingResult {
         groups,
         dimensions,
-        hashes,
         failed,
     }
 }
@@ -1373,95 +1327,6 @@ fn size_group(images: &[GroupingImage], indices: Vec<usize>) -> (String, Vec<usi
         ),
         indices,
     )
-}
-
-fn duplicate_groups(
-    images: &[GroupingImage],
-    sender: &Sender<BackgroundEvent>,
-    cancel: &AtomicBool,
-    hash_progress: usize,
-    total_progress: usize,
-) -> ImageGroups {
-    let mut parent: Vec<usize> = (0..images.len()).collect();
-    let mut has_duplicate = vec![false; images.len()];
-    let pair_count = images
-        .iter()
-        .enumerate()
-        .filter(|(_, image)| image.perceptual_hash.flatten().is_some())
-        .map(|(index, _)| images.len().saturating_sub(index + 1))
-        .sum::<usize>();
-    let mut pairs_checked = 0;
-    for left in 0..images.len() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let Some(left_hash) = images[left].perceptual_hash.flatten() else {
-            continue;
-        };
-        for right in (left + 1)..images.len() {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            pairs_checked += 1;
-            if let Some(right_hash) = images[right].perceptual_hash.flatten()
-                && (left_hash ^ right_hash).count_ones() <= DUPLICATE_HASH_DISTANCE
-            {
-                let left_root = find_root(&mut parent, left);
-                let right_root = find_root(&mut parent, right);
-                parent[right_root] = left_root;
-                has_duplicate[left] = true;
-                has_duplicate[right] = true;
-            }
-            if pairs_checked % 2048 == 0 || pairs_checked == pair_count || right + 1 == images.len()
-            {
-                send_progress(
-                    sender,
-                    hash_progress + pairs_checked,
-                    total_progress,
-                    cancel,
-                );
-            }
-        }
-    }
-
-    let mut grouped: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (index, &is_duplicate) in has_duplicate.iter().enumerate() {
-        if is_duplicate {
-            let root = find_root(&mut parent, index);
-            grouped.entry(root).or_default().push(index);
-        }
-    }
-    let mut groups: Vec<_> = grouped
-        .into_values()
-        .map(|indices| {
-            let label = format!("Possible duplicates ({})", indices.len());
-            (label, indices)
-        })
-        .collect();
-    groups.sort_by(|left, right| left.0.cmp(&right.0));
-    groups
-}
-
-fn find_root(parent: &mut [usize], mut index: usize) -> usize {
-    while parent[index] != index {
-        parent[index] = parent[parent[index]];
-        index = parent[index];
-    }
-    index
-}
-
-fn perceptual_hash(path: &Path) -> Result<u64> {
-    let image = image::open(path).with_context(|| format!("decoding {}", path.display()))?;
-    let sample = image.resize_exact(9, 8, FilterType::Triangle).to_luma8();
-    let mut hash = 0_u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            if sample.get_pixel(x, y)[0] > sample.get_pixel(x + 1, y)[0] {
-                hash |= 1 << (y * 8 + x);
-            }
-        }
-    }
-    Ok(hash)
 }
 
 fn copy_to_directory(source: &Path, destination: &Path) -> Result<()> {
@@ -1611,14 +1476,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn image_entry(name: &str, size: u64, hash: Option<u64>) -> GroupingImage {
+    fn image_entry(name: &str, size: u64) -> GroupingImage {
         GroupingImage {
             path: PathBuf::from(name),
             dimensions: Some((640, 480)),
             dimensions_loaded: true,
             file_size: size,
             extension: "jpg".to_owned(),
-            perceptual_hash: Some(hash),
         }
     }
 
@@ -1661,7 +1525,6 @@ mod tests {
             thumbnail: None,
             thumbnail_loaded: false,
             thumbnail_error: None,
-            perceptual_hash: None,
         };
 
         let metadata = selected_file_metadata(&mut entry);
@@ -1679,13 +1542,9 @@ mod tests {
         for mode in [
             GroupMode::Dimensions,
             GroupMode::SimilarSize,
-            GroupMode::Duplicates,
             GroupMode::FileType,
         ] {
-            let images = vec![
-                image_entry("a.jpg", 1000, Some(0)),
-                image_entry("b.png", 1090, Some(1)),
-            ];
+            let images = vec![image_entry("a.jpg", 1000), image_entry("b.png", 1090)];
             let (sender, receiver) = mpsc::channel();
             let result = group_images(images, mode, sender, Arc::new(AtomicBool::new(false)));
             let progress: Vec<_> = receiver
@@ -1845,9 +1704,9 @@ mod tests {
     #[test]
     fn similar_sizes_are_grouped_within_ten_percent() {
         let images = vec![
-            image_entry("a.jpg", 1000, None),
-            image_entry("b.jpg", 1090, None),
-            image_entry("c.jpg", 1300, None),
+            image_entry("a.jpg", 1000),
+            image_entry("b.jpg", 1090),
+            image_entry("c.jpg", 1300),
         ];
 
         let (sender, _receiver) = mpsc::channel();
@@ -1856,27 +1715,6 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].1, vec![0, 1]);
         assert_eq!(groups[1].1, vec![2]);
-    }
-
-    #[test]
-    fn similar_visual_hashes_are_grouped_but_unrelated_images_are_not() {
-        let images = vec![
-            image_entry("a.jpg", 1000, Some(0)),
-            image_entry("b.jpg", 1000, Some(1)),
-            image_entry("c.jpg", 1000, Some(u64::MAX)),
-        ];
-
-        let (sender, _receiver) = mpsc::channel();
-        let groups = duplicate_groups(
-            &images,
-            &sender,
-            &AtomicBool::new(false),
-            images.len(),
-            images.len() + images.len() * (images.len() - 1) / 2,
-        );
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].1, vec![0, 1]);
     }
 
     #[test]
